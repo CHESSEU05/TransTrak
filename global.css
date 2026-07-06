@@ -1,0 +1,29 @@
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/preflight.css" layer(base);
+@import "tailwindcss/utilities.css";
+
+@import "nativewind/theme";
+
+@layer theme {
+  @theme {
+    --color-primary: #007fff;
+    --color-accent: #004d99;
+    --color-success: #2ecc71;
+    --color-warning: #f39c12;
+    --color-danger: #e74c3c;
+    --color-background: #f7f9fc;
+    --color-surface: #ffffff;
+    --color-text: #1f2937;
+    --color-textSecondary: #6b7280;
+    --color-divider: #e5e7eb;
+
+    --font-jakarta: "PlusJakartaSans-Regular";
+    --font-jakarta-bold: "PlusJakartaSans-Bold";
+    --font-jakarta-semibold: "PlusJakartaSans-SemiBold";
+    --font-jakarta-medium: "PlusJakartaSans-Medium";
+    --font-jakarta-light: "PlusJakartaSans-Light";
+    --font-jakarta-extralight: "PlusJakartaSans-ExtraLight";
+    --font-jakarta-extrabold: "PlusJakartaSans-ExtraBold";
+    --font-dmserif: "DMSerifDisplay-Regular";
+  }
+}

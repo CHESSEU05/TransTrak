@@ -1,0 +1,17 @@
+{
+  "java.dependency.syncWithFolderExplorer": true,
+  "java.project.explorer.showNonJavaResources": false,
+
+  "editor.formatOnPaste": true,
+  "editor.formatOnSave": true,
+  "[typescriptreact]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[typescript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "editor.codeActionsOnSave": {
+    "source.fixAll.prettier": "explicit",
+    "source.fixAll.ts": "explicit"
+  }
+}
