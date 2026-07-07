@@ -2,29 +2,48 @@ import { Text, View } from "react-native";
 import { MapPin } from "lucide-react-native";
 
 import { colors } from "../../constants/colors";
-import { PLACES } from "../../services/app/appService";
 import type { DriverSummary } from "../../services/app/appService";
 
+type Coordinate = {
+  latitude: number;
+  longitude: number;
+};
+
 type RouteMapProps = {
+  destination?: Coordinate | null;
   drivers?: DriverSummary[];
   destinationName?: string;
+  pickup?: Coordinate | null;
   pickupName?: string;
 };
 
 export function RouteMap({
+  destination,
   drivers = [],
-  destinationName = PLACES.destination.name,
-  pickupName = PLACES.pickup.name,
+  destinationName = "Destination",
+  pickup,
+  pickupName = "Pickup",
 }: RouteMapProps) {
+  const hasMapData =
+    Boolean(pickup) ||
+    Boolean(destination) ||
+    drivers.some(
+      (driver) =>
+        typeof driver.currentLatitude === "number" &&
+        typeof driver.currentLongitude === "number"
+    );
+
   return (
     <View className="overflow-hidden rounded-2xl border border-divider bg-surface">
       <View className="h-52 items-center justify-center bg-primary/10 px-6">
         <MapPin color={colors.primary} size={28} />
         <Text className="mt-3 text-center font-jakarta-bold text-text">
-          Map preview is enabled on mobile.
+          {hasMapData ? "Map preview is enabled on mobile." : "Location not available yet"}
         </Text>
         <Text className="mt-1 text-center font-jakarta text-sm text-textSecondary">
-          {drivers.length} driver{drivers.length === 1 ? "" : "s"} visible for this route.
+          {hasMapData
+            ? `${drivers.length} driver${drivers.length === 1 ? "" : "s"} visible for this route.`
+            : "Share your location or choose mapped places to show nearby transport."}
         </Text>
       </View>
       <View className="flex-row border-t border-divider px-4 py-3">

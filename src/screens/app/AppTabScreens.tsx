@@ -12,7 +12,6 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-import * as Location from "expo-location";
 import {
   AlertTriangle,
   Bike,
@@ -22,10 +21,14 @@ import {
   Clock3,
   Edit3,
   FileText,
+  FileUp,
   Info,
+  LocateFixed,
+  MapPin,
   Navigation,
   Phone,
   RadioTower,
+  RefreshCw,
   Search,
   ShieldCheck,
   UserRound,
@@ -44,9 +47,12 @@ import {
   getAdminDashboard,
   getDriverDashboard,
   getPassengerDashboard,
-  PLACES,
+  listRouteMatchedDrivers,
+  recordDriverLocationUpdate,
+  REPORT_TYPES,
   saveDriverRoute,
   STATUS,
+  submitDriverVerification,
   updateDriverAvailability,
   updateDriverVerification,
   updateDriverVehicle,
@@ -57,9 +63,18 @@ import {
 } from "../../services/app/appService";
 import type {
   DriverSummary,
+  DriverVerificationSummary,
+  RoutePointInput,
   ReportSummary,
   TransportRequestSummary,
 } from "../../services/app/appService";
+import {
+  geocodeAddress,
+  getPlaceDetails,
+  isGooglePlacesConfigured,
+  searchPlacePredictions,
+} from "../../services/location/googlePlacesService";
+import { getCurrentDevicePlace, type PlaceSelection } from "../../services/location/locationService";
 import type { Profile } from "../../types/auth";
 
 type ResourceState<T> = {
@@ -134,35 +149,35 @@ function formatShortDate(value?: string | null) {
 function getRequestStatus(statusId: number) {
   switch (statusId) {
     case STATUS.REQUEST_ACCEPTED:
-      return { label: "Accepted", color: colors.success, bg: "#EAFBF1" };
+      return { label: "Accepted", color: colors.success, bg: colors.successSoft };
     case STATUS.REQUEST_REJECTED:
-      return { label: "Rejected", color: colors.danger, bg: "#FDECEC" };
+      return { label: "Rejected", color: colors.danger, bg: colors.dangerSoft };
     case STATUS.REQUEST_CANCELLED:
-      return { label: "Cancelled", color: colors.danger, bg: "#FDECEC" };
+      return { label: "Cancelled", color: colors.danger, bg: colors.dangerSoft };
     case STATUS.REQUEST_COMPLETED:
-      return { label: "Completed", color: colors.success, bg: "#EAFBF1" };
+      return { label: "Completed", color: colors.success, bg: colors.successSoft };
     default:
-      return { label: "Pending", color: colors.warning, bg: "#FFF7E8" };
+      return { label: "Pending", color: colors.warning, bg: colors.warningSoft };
   }
 }
 
 function getVerificationStatus(statusId: number) {
   switch (statusId) {
     case STATUS.VERIFICATION_APPROVED:
-      return { label: "Approved", color: colors.success, bg: "#EAFBF1" };
+      return { label: "Approved", color: colors.success, bg: colors.successSoft };
     case STATUS.VERIFICATION_REJECTED:
-      return { label: "Rejected", color: colors.danger, bg: "#FDECEC" };
+      return { label: "Rejected", color: colors.danger, bg: colors.dangerSoft };
     default:
-      return { label: "Pending", color: colors.warning, bg: "#FFF7E8" };
+      return { label: "Pending", color: colors.warning, bg: colors.warningSoft };
   }
 }
 
 function getAvailabilityStatus(statusId: number) {
   switch (statusId) {
     case STATUS.AVAILABILITY_ONLINE:
-      return { label: "Online", color: colors.success, bg: "#EAFBF1" };
+      return { label: "Online", color: colors.success, bg: colors.successSoft };
     case STATUS.AVAILABILITY_BUSY:
-      return { label: "Busy", color: colors.warning, bg: "#FFF7E8" };
+      return { label: "Busy", color: colors.warning, bg: colors.warningSoft };
     default:
       return { label: "Offline", color: colors.textSecondary, bg: "#F3F4F6" };
   }
@@ -171,26 +186,26 @@ function getAvailabilityStatus(statusId: number) {
 function getReportStatus(statusId: number) {
   switch (statusId) {
     case STATUS.REPORT_IN_REVIEW:
-      return { label: "In Review", color: colors.warning, bg: "#FFF7E8" };
+      return { label: "In Review", color: colors.warning, bg: colors.warningSoft };
     case STATUS.REPORT_RESOLVED:
-      return { label: "Resolved", color: colors.success, bg: "#EAFBF1" };
+      return { label: "Resolved", color: colors.success, bg: colors.successSoft };
     case STATUS.REPORT_DISMISSED:
-      return { label: "Dismissed", color: colors.danger, bg: "#FDECEC" };
+      return { label: "Dismissed", color: colors.danger, bg: colors.dangerSoft };
     default:
-      return { label: "Open", color: colors.danger, bg: "#FDECEC" };
+      return { label: "Open", color: colors.danger, bg: colors.dangerSoft };
   }
 }
 
 function getAccountStatus(statusId: number) {
   switch (statusId) {
     case STATUS.ACCOUNT_SUSPENDED:
-      return { label: "Suspended", color: colors.warning, bg: "#FFF7E8" };
+      return { label: "Suspended", color: colors.warning, bg: colors.warningSoft };
     case STATUS.ACCOUNT_BLOCKED:
-      return { label: "Blocked", color: colors.danger, bg: "#FDECEC" };
+      return { label: "Blocked", color: colors.danger, bg: colors.dangerSoft };
     case STATUS.ACCOUNT_INACTIVE:
       return { label: "Inactive", color: colors.textSecondary, bg: "#F3F4F6" };
     default:
-      return { label: "Active", color: colors.success, bg: "#EAFBF1" };
+      return { label: "Active", color: colors.success, bg: colors.successSoft };
   }
 }
 
@@ -227,6 +242,285 @@ const BIKE_COLOURS = [
   { name: "Brown", hex: "#92400E" },
   { name: "Silver", hex: "#D1D5DB" },
 ];
+
+function toRoutePoint(place: PlaceSelection): RoutePointInput {
+  return {
+    latitude: place.latitude,
+    longitude: place.longitude,
+    name: place.name,
+  };
+}
+
+function friendlyAppError(error: unknown, fallback = "Something went wrong. Please try again.") {
+  const message = error instanceof Error ? error.message : fallback;
+  const normalized = message.toLowerCase();
+
+  if (normalized.includes("invalid login credentials")) {
+    return "The email or password is not correct. Please check both and try again.";
+  }
+
+  if (normalized.includes("network request failed") || normalized.includes("failed to fetch")) {
+    return "We could not reach the server. Check your internet connection and try again.";
+  }
+
+  if (normalized.includes("row-level security") || normalized.includes("permission denied")) {
+    return "This action is not allowed for your current account status.";
+  }
+
+  return message || fallback;
+}
+
+function InlineNotice({
+  message,
+  tone = "info",
+}: {
+  message: string;
+  tone?: "danger" | "info" | "success" | "warning";
+}) {
+  const palette = {
+    danger: { bg: colors.dangerSoft, border: colors.danger, icon: colors.danger },
+    info: { bg: colors.primarySoft, border: colors.primary, icon: colors.primary },
+    success: { bg: colors.successSoft, border: colors.success, icon: colors.success },
+    warning: { bg: colors.warningSoft, border: colors.warning, icon: colors.warning },
+  }[tone];
+
+  return (
+    <View
+      className="flex-row items-start rounded-2xl border p-3"
+      style={{ backgroundColor: palette.bg, borderColor: palette.border }}
+    >
+      <Info color={palette.icon} size={18} />
+      <Text className="ml-2 flex-1 font-jakarta text-sm text-text">{message}</Text>
+    </View>
+  );
+}
+
+function LocationCard({
+  loading,
+  message,
+  onRefresh,
+  place,
+}: {
+  loading?: boolean;
+  message?: string | null;
+  onRefresh: () => void;
+  place?: PlaceSelection | null;
+}) {
+  return (
+    <View className="rounded-2xl border border-divider bg-surface p-4">
+      <View className="flex-row items-center justify-between">
+        <View className="flex-row items-center">
+          <View className="mr-3 h-10 w-10 items-center justify-center rounded-full bg-success/10">
+            <MapPin color={colors.success} size={19} />
+          </View>
+          <View className="flex-1">
+            <Text className="font-jakarta-bold text-base text-text">Current location</Text>
+            <Text className="mt-1 font-jakarta text-sm text-textSecondary">
+              {place?.name ?? message ?? "Share location to show nearby transport."}
+            </Text>
+          </View>
+        </View>
+        <TouchableOpacity
+          activeOpacity={0.8}
+          onPress={onRefresh}
+          className="h-10 w-10 items-center justify-center rounded-full bg-primary/10"
+        >
+          {loading ? (
+            <ActivityIndicator color={colors.primary} />
+          ) : (
+            <LocateFixed color={colors.primary} size={19} />
+          )}
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
+
+function useCurrentLocationOnDemand() {
+  const [place, setPlace] = useState<PlaceSelection | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const refresh = useCallback(async (requestPermission = true) => {
+    setLoading(true);
+
+    try {
+      const result = await getCurrentDevicePlace({ requestPermission });
+
+      if (result.status === "granted") {
+        setPlace(result.place);
+        setMessage(null);
+      } else {
+        setMessage(result.message);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refresh(false);
+  }, [refresh]);
+
+  return { loading, message, place, refresh };
+}
+
+function PlaceInput({
+  label,
+  onSelect,
+  onUseCurrentLocation,
+  placeholder,
+  value,
+}: {
+  label: string;
+  onSelect: (place: PlaceSelection, typedValue: string) => void;
+  onUseCurrentLocation?: () => Promise<void>;
+  placeholder: string;
+  value: string;
+}) {
+  const [text, setText] = useState(value);
+  const [predictions, setPredictions] = useState<
+    { description: string; id: string; name: string }[]
+  >([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setText(value);
+  }, [value]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadPredictions() {
+      if (!text.trim() || text.trim() === value.trim()) {
+        setPredictions([]);
+        setError(null);
+        return;
+      }
+
+      setLoading(true);
+      setError(null);
+
+      try {
+        const nextPredictions = await searchPlacePredictions(text);
+
+        if (!cancelled) {
+          setPredictions(nextPredictions);
+        }
+      } catch (predictionError) {
+        if (!cancelled) {
+          setError(friendlyAppError(predictionError));
+          setPredictions([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    }
+
+    const timer = setTimeout(loadPredictions, 350);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [text, value]);
+
+  async function selectPrediction(placeId: string) {
+    setLoading(true);
+    setError(null);
+
+    try {
+      const place = await getPlaceDetails(placeId);
+      setText(place.name);
+      setPredictions([]);
+      onSelect(place, place.name);
+    } catch (selectionError) {
+      setError(friendlyAppError(selectionError));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function resolveTypedAddress() {
+    setLoading(true);
+    setError(null);
+
+    try {
+      const place = await geocodeAddress(text);
+      setText(place.name);
+      setPredictions([]);
+      onSelect(place, place.name);
+    } catch (geocodeError) {
+      setError(friendlyAppError(geocodeError));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <View>
+      <View className="flex-row items-center justify-between">
+        <Text className="font-jakarta-semibold text-sm text-text">{label}</Text>
+        {loading ? <ActivityIndicator color={colors.primary} /> : null}
+      </View>
+      <TextInput
+        value={text}
+        onChangeText={(nextText) => {
+          setText(nextText);
+          setError(null);
+        }}
+        placeholder={placeholder}
+        placeholderTextColor={colors.textSecondary}
+        className="mt-2 h-12 rounded-xl border border-divider bg-background px-4 font-jakarta text-text"
+      />
+      <View className="mt-2 flex-row flex-wrap gap-2">
+        {onUseCurrentLocation ? (
+          <TouchableOpacity
+            activeOpacity={0.8}
+            onPress={onUseCurrentLocation}
+            className="flex-row items-center rounded-full bg-success/10 px-3 py-2"
+          >
+            <LocateFixed color={colors.success} size={15} />
+            <Text className="ml-1 font-jakarta-bold text-xs text-success">Use current</Text>
+          </TouchableOpacity>
+        ) : null}
+        <TouchableOpacity
+          activeOpacity={0.8}
+          onPress={resolveTypedAddress}
+          className="flex-row items-center rounded-full bg-primary/10 px-3 py-2"
+        >
+          <Search color={colors.primary} size={15} />
+          <Text className="ml-1 font-jakarta-bold text-xs text-primary">Find address</Text>
+        </TouchableOpacity>
+      </View>
+      {!isGooglePlacesConfigured() ? (
+        <Text className="mt-2 font-jakarta text-xs text-warning">
+          Google Maps key is missing, so suggestions are disabled until the key is configured.
+        </Text>
+      ) : null}
+      {error ? <Text className="mt-2 font-jakarta text-xs text-danger">{error}</Text> : null}
+      {predictions.length > 0 ? (
+        <View className="mt-2 overflow-hidden rounded-xl border border-divider bg-surface">
+          {predictions.map((prediction) => (
+            <TouchableOpacity
+              key={prediction.id}
+              activeOpacity={0.8}
+              onPress={() => selectPrediction(prediction.id)}
+              className="border-b border-divider px-3 py-3"
+            >
+              <Text className="font-jakarta-bold text-sm text-text">{prediction.name}</Text>
+              <Text className="mt-0.5 font-jakarta text-xs text-textSecondary">
+                {prediction.description}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      ) : null}
+    </View>
+  );
+}
 
 function ScreenShell({
   children,
@@ -445,6 +739,14 @@ function DriverCard({
                 }`
               : "Route not shared yet"}
           </Text>
+          {typeof driver.distanceToPickupKm === "number" ? (
+            <Text className="mt-1 font-jakarta text-xs text-textSecondary">
+              {driver.distanceToPickupKm.toFixed(1)} km from pickup
+              {typeof driver.routeAlignmentScore === "number"
+                ? ` - ${driver.routeAlignmentScore.toFixed(0)}% route match`
+                : ""}
+            </Text>
+          ) : null}
         </View>
       </View>
       {onRequest || onViewDetails ? (
@@ -533,7 +835,27 @@ function DriverDetailPanel({
       </View>
 
       <View className="mt-4">
-        <RouteMap drivers={[driver]} />
+        <RouteMap
+          destination={
+            driver.activeRoute
+              ? {
+                  latitude: driver.activeRoute.destination_latitude,
+                  longitude: driver.activeRoute.destination_longitude,
+                }
+              : null
+          }
+          destinationName={driver.activeRoute?.destination_name ?? "Destination"}
+          drivers={[driver]}
+          pickup={
+            driver.activeRoute
+              ? {
+                  latitude: driver.activeRoute.start_latitude,
+                  longitude: driver.activeRoute.start_longitude,
+                }
+              : null
+          }
+          pickupName={driver.activeRoute?.start_name ?? "Pickup"}
+        />
       </View>
 
       <View className="mt-4 flex-row gap-3">
@@ -550,6 +872,7 @@ function RequestCard({
   onCancel,
   onComplete,
   onReject,
+  onShareLocation,
   request,
 }: {
   canRespond?: boolean;
@@ -558,9 +881,34 @@ function RequestCard({
   onCancel?: () => void;
   onComplete?: () => void;
   onReject?: () => void;
+  onShareLocation?: () => void;
   request: TransportRequestSummary;
 }) {
   const status = getRequestStatus(request.requestStatusId);
+  const mapDriver =
+    request.driverProfileId &&
+    typeof request.driverCurrentLatitude === "number" &&
+    typeof request.driverCurrentLongitude === "number"
+      ? ({
+          id: request.driverProfileId,
+          profileId: request.driverProfileId,
+          name: request.driverName,
+          phone: null,
+          avatarUrl: null,
+          availabilityStatusId: STATUS.AVAILABILITY_ONLINE,
+          verificationStatusId: STATUS.VERIFICATION_APPROVED,
+          currentLatitude: request.driverCurrentLatitude,
+          currentLongitude: request.driverCurrentLongitude,
+          lastLocationAt: null,
+          vehicleId: null,
+          vehicleTypeId: null,
+          vehicleStatusId: null,
+          vehicleModel: null,
+          vehicleLabel: request.vehicleLabel,
+          plateNumber: request.plateNumber,
+          activeRoute: null,
+        } satisfies DriverSummary)
+      : null;
 
   return (
     <View className="rounded-2xl border border-divider bg-surface p-4">
@@ -582,6 +930,24 @@ function RequestCard({
         <Text className="mt-3 rounded-xl bg-background px-3 py-2 font-jakarta text-sm text-text">
           {request.passengerNote}
         </Text>
+      ) : null}
+      {request.requestStatusId === STATUS.REQUEST_ACCEPTED ||
+      request.requestStatusId === STATUS.REQUEST_PENDING ? (
+        <View className="mt-4">
+          <RouteMap
+            destination={{
+              latitude: request.destinationLatitude,
+              longitude: request.destinationLongitude,
+            }}
+            destinationName={request.destinationName}
+            drivers={mapDriver ? [mapDriver] : []}
+            pickup={{
+              latitude: request.pickupLatitude,
+              longitude: request.pickupLongitude,
+            }}
+            pickupName={request.pickupName}
+          />
+        </View>
       ) : null}
       <View className="mt-4 flex-row gap-3">
         {onAccept ? (
@@ -614,6 +980,14 @@ function RequestCard({
             label="Complete"
             loading={isUpdating}
             onPress={onComplete}
+          />
+        ) : null}
+        {onShareLocation ? (
+          <PrimaryButton
+            label="Share location"
+            loading={isUpdating}
+            onPress={onShareLocation}
+            tone="outline"
           />
         ) : null}
       </View>
@@ -707,6 +1081,111 @@ function VerificationBanner({ driver }: { driver: DriverSummary | null }) {
   );
 }
 
+function DriverVerificationPanel({
+  driver,
+  onSubmitted,
+  verification,
+}: {
+  driver: DriverSummary | null;
+  onSubmitted: () => Promise<void>;
+  verification: DriverVerificationSummary | null;
+}) {
+  const [documentUrl, setDocumentUrl] = useState(verification?.documentUrl ?? "");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  useEffect(() => {
+    setDocumentUrl(verification?.documentUrl ?? "");
+  }, [verification?.documentUrl]);
+
+  if (!driver) {
+    return null;
+  }
+
+  const status = getVerificationStatus(verification?.statusId ?? driver.verificationStatusId);
+
+  async function handleSubmit() {
+    if (!driver) {
+      return;
+    }
+
+    if (!documentUrl.trim()) {
+      Alert.alert("Document needed", "Add a public document link for admin verification.");
+      return;
+    }
+
+    setIsSubmitting(true);
+
+    try {
+      await submitDriverVerification({
+        driverProfileId: driver.id,
+        documentUrl,
+      });
+      await onSubmitted();
+      Alert.alert("Verification submitted", "The administrator can now review your document.");
+    } catch (error) {
+      Alert.alert("Verification failed", friendlyAppError(error));
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  return (
+    <View className="rounded-2xl border border-divider bg-surface p-4">
+      <View className="flex-row items-start justify-between">
+        <View className="flex-1 flex-row pr-3">
+          <View className="mr-3 h-10 w-10 items-center justify-center rounded-full bg-primary/10">
+            <FileUp color={colors.primary} size={19} />
+          </View>
+          <View className="flex-1">
+            <Text className="font-jakarta-bold text-base text-text">Driver verification</Text>
+            <Text className="mt-1 font-jakarta text-sm text-textSecondary">
+              Submit your license, ID card, or vehicle document link for admin approval.
+            </Text>
+          </View>
+        </View>
+        <StatusBadge {...status} />
+      </View>
+
+      {verification?.rejectionReason ? (
+        <View className="mt-3">
+          <InlineNotice message={verification.rejectionReason} tone="danger" />
+        </View>
+      ) : null}
+
+      {verification?.reviewedAt ? (
+        <Text className="mt-3 font-jakarta text-xs text-textSecondary">
+          Last reviewed {formatShortDate(verification.reviewedAt)}
+        </Text>
+      ) : null}
+
+      <Text className="mt-4 font-jakarta-semibold text-sm text-text">Document URL</Text>
+      <TextInput
+        value={documentUrl}
+        onChangeText={setDocumentUrl}
+        placeholder="https://..."
+        placeholderTextColor={colors.textSecondary}
+        autoCapitalize="none"
+        keyboardType="url"
+        className="mt-2 h-12 rounded-xl border border-divider bg-background px-4 font-jakarta text-text"
+      />
+      <View className="mt-4 flex-row gap-3">
+        <PrimaryButton
+          label={verification?.documentUrl ? "Resubmit" : "Submit"}
+          loading={isSubmitting}
+          onPress={handleSubmit}
+        />
+        <TouchableOpacity
+          activeOpacity={0.8}
+          onPress={onSubmitted}
+          className="h-12 w-12 items-center justify-center rounded-xl bg-primary/10"
+        >
+          <RefreshCw color={colors.primary} size={19} />
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
+
 function ReportComposer({
   onSubmitted,
   reporterId,
@@ -716,6 +1195,7 @@ function ReportComposer({
 }) {
   const [title, setTitle] = useState("Route issue");
   const [description, setDescription] = useState("");
+  const [reportTypeId, setReportTypeId] = useState<number>(REPORT_TYPES[0].id);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   async function handleSubmit() {
@@ -729,6 +1209,7 @@ function ReportComposer({
     try {
       await createReport({
         reporterId,
+        reportTypeId,
         title,
         description,
       });
@@ -745,10 +1226,36 @@ function ReportComposer({
   return (
     <View className="rounded-2xl border border-divider bg-surface p-4">
       <Text className="font-jakarta-bold text-base text-text">Submit a report</Text>
+      <Text className="mt-4 font-jakarta-semibold text-sm text-text">Report type</Text>
+      <View className="mt-2 flex-row flex-wrap gap-2">
+        {REPORT_TYPES.map((type) => {
+          const selected = reportTypeId === type.id;
+
+          return (
+            <TouchableOpacity
+              key={type.id}
+              activeOpacity={0.8}
+              onPress={() => {
+                setReportTypeId(type.id);
+                setTitle(type.label);
+              }}
+              className={`rounded-full px-3 py-2 ${selected ? "bg-primary" : "bg-background"}`}
+            >
+              <Text
+                className={`font-jakarta-bold text-xs ${
+                  selected ? "text-white" : "text-textSecondary"
+                }`}
+              >
+                {type.label}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
       <TextInput
         value={title}
         onChangeText={setTitle}
-        placeholder="Report type"
+        placeholder="Short title"
         placeholderTextColor={colors.textSecondary}
         className="mt-4 h-12 rounded-xl border border-divider bg-background px-4 font-jakarta text-text"
       />
@@ -771,6 +1278,7 @@ function ReportComposer({
 export function PassengerHomeScreen() {
   const navigation = useNavigation<any>();
   const { profile } = useAuth();
+  const currentLocation = useCurrentLocationOnDemand();
   const resource = useAsyncResource(
     () => getPassengerDashboard(profile?.id ?? ""),
     [profile?.id]
@@ -793,11 +1301,28 @@ export function PassengerHomeScreen() {
       {resource.error ? <ErrorState message={resource.error} onRetry={resource.refresh} /> : null}
       {data ? (
         <>
+          <LocationCard
+            loading={currentLocation.loading}
+            message={currentLocation.message}
+            onRefresh={() => currentLocation.refresh(true)}
+            place={currentLocation.place}
+          />
           <View className="flex-row gap-3">
             <StatCard icon={Car} label="Nearby drivers" value={`${data.availableDrivers.length}`} />
             <StatCard icon={ClipboardList} label="Requests" value={`${data.requests.length}`} />
           </View>
-          <RouteMap drivers={data.availableDrivers} />
+          <RouteMap
+            drivers={data.availableDrivers}
+            pickup={
+              currentLocation.place
+                ? {
+                    latitude: currentLocation.place.latitude,
+                    longitude: currentLocation.place.longitude,
+                  }
+                : null
+            }
+            pickupName={currentLocation.place?.name ?? "Current location"}
+          />
           {activeRequest ? (
             <RequestCard request={activeRequest} />
           ) : (
@@ -825,18 +1350,79 @@ export function PassengerSearchScreen() {
     () => getPassengerDashboard(profile?.id ?? ""),
     [profile?.id]
   );
-  const [pickup, setPickup] = useState<string>(PLACES.pickup.name);
-  const [destination, setDestination] = useState<string>(PLACES.destination.name);
+  const [pickup, setPickup] = useState("");
+  const [destination, setDestination] = useState("");
+  const [pickupPlace, setPickupPlace] = useState<PlaceSelection | null>(null);
+  const [destinationPlace, setDestinationPlace] = useState<PlaceSelection | null>(null);
+  const [drivers, setDrivers] = useState<DriverSummary[]>([]);
+  const [isMatching, setIsMatching] = useState(false);
+  const [matchError, setMatchError] = useState<string | null>(null);
   const [selectedDriverId, setSelectedDriverId] = useState<string | null>(null);
   const [selectedDriver, setSelectedDriver] = useState<DriverSummary | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadMatches() {
+      if (!pickupPlace || !destinationPlace) {
+        setDrivers([]);
+        setMatchError(null);
+        return;
+      }
+
+      setIsMatching(true);
+      setMatchError(null);
+
+      try {
+        const matchedDrivers = await listRouteMatchedDrivers({
+          pickup: toRoutePoint(pickupPlace),
+          destination: toRoutePoint(destinationPlace),
+          limit: 12,
+        });
+
+        if (!cancelled) {
+          setDrivers(matchedDrivers);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setDrivers([]);
+          setMatchError(friendlyAppError(error));
+        }
+      } finally {
+        if (!cancelled) {
+          setIsMatching(false);
+        }
+      }
+    }
+
+    loadMatches();
+    return () => {
+      cancelled = true;
+    };
+  }, [destinationPlace, pickupPlace]);
+
+  async function useCurrentPickup() {
+    const result = await getCurrentDevicePlace({ requestPermission: true });
+
+    if (result.status !== "granted") {
+      Alert.alert("Location needed", result.message);
+      return;
+    }
+
+    setPickupPlace(result.place);
+    setPickup(result.place.name);
+  }
 
   async function handleSendRequest(driver: DriverSummary) {
     if (!profile?.id) {
       return;
     }
 
-    if (!pickup.trim() || !destination.trim()) {
-      Alert.alert("Route needed", "Enter both pickup and destination.");
+    if (!pickupPlace || !destinationPlace) {
+      Alert.alert(
+        "Mapped route needed",
+        "Choose a pickup and destination from Google Maps or use Find address before sending a request."
+      );
       return;
     }
 
@@ -846,8 +1432,8 @@ export function PassengerSearchScreen() {
       await createTransportRequest({
         passengerId: profile.id,
         driverProfileId: driver.id,
-        pickupName: pickup,
-        destinationName: destination,
+        pickup: toRoutePoint(pickupPlace),
+        destination: toRoutePoint(destinationPlace),
         passengerNote: "Route-aware request from passenger search.",
       });
       await resource.refresh();
@@ -859,8 +1445,6 @@ export function PassengerSearchScreen() {
     }
   }
 
-  const drivers = resource.data?.availableDrivers ?? [];
-
   return (
     <ScreenShell
       title="Search"
@@ -870,24 +1454,57 @@ export function PassengerSearchScreen() {
     >
       <View className="rounded-2xl border border-divider bg-surface p-4">
         <Text className="font-jakarta-bold text-base text-text">Where are you going?</Text>
-        <TextInput
-          value={pickup}
-          onChangeText={setPickup}
-          placeholder="Pickup"
-          placeholderTextColor={colors.textSecondary}
-          className="mt-4 h-12 rounded-xl border border-divider bg-background px-4 font-jakarta text-text"
-        />
-        <TextInput
-          value={destination}
-          onChangeText={setDestination}
-          placeholder="Destination"
-          placeholderTextColor={colors.textSecondary}
-          className="mt-3 h-12 rounded-xl border border-divider bg-background px-4 font-jakarta text-text"
+        <View className="mt-4 gap-4">
+          <PlaceInput
+            label="Pickup"
+            onSelect={(place, typedValue) => {
+              setPickupPlace(place);
+              setPickup(typedValue);
+            }}
+            onUseCurrentLocation={useCurrentPickup}
+            placeholder="Pickup location"
+            value={pickup}
+          />
+          <PlaceInput
+            label="Destination"
+            onSelect={(place, typedValue) => {
+              setDestinationPlace(place);
+              setDestination(typedValue);
+            }}
+            placeholder="Where are you going?"
+            value={destination}
+          />
+        </View>
+        <InlineNotice
+          message="Drivers are shown only after both places are mapped, then sorted by route alignment and distance to pickup."
+          tone="info"
         />
       </View>
-      <RouteMap drivers={drivers} pickupName={pickup} destinationName={destination} />
+      <RouteMap
+        destination={
+          destinationPlace
+            ? {
+                latitude: destinationPlace.latitude,
+                longitude: destinationPlace.longitude,
+              }
+            : null
+        }
+        destinationName={destinationPlace?.name ?? (destination || "Destination")}
+        drivers={drivers}
+        pickup={
+          pickupPlace
+            ? {
+                latitude: pickupPlace.latitude,
+                longitude: pickupPlace.longitude,
+              }
+            : null
+        }
+        pickupName={pickupPlace?.name ?? (pickup || "Pickup")}
+      />
       {resource.isLoading ? <LoadingState /> : null}
       {resource.error ? <ErrorState message={resource.error} onRetry={resource.refresh} /> : null}
+      {isMatching ? <LoadingState /> : null}
+      {matchError ? <ErrorState message={matchError} onRetry={resource.refresh} /> : null}
       {selectedDriver ? (
         <DriverDetailPanel
           driver={selectedDriver}
@@ -912,8 +1529,12 @@ export function PassengerSearchScreen() {
       ) : (
         <EmptyState
           icon={Car}
-          title="No available drivers yet"
-          description="Drivers appear here when they are verified, online, and sharing location."
+          title={pickupPlace && destinationPlace ? "No route-matched drivers yet" : "Map your route"}
+          description={
+            pickupPlace && destinationPlace
+              ? "No verified online driver currently matches this pickup and destination."
+              : "Choose a pickup and destination to find drivers whose route can serve you."
+          }
         />
       )}
     </ScreenShell>
@@ -1038,6 +1659,9 @@ export function DriverHomeScreen() {
   const [isUpdating, setIsUpdating] = useState(false);
   const driver = resource.data?.driver ?? null;
   const canOperate = driver?.verificationStatusId === STATUS.VERIFICATION_APPROVED;
+  const acceptedRequest = resource.data?.requests.find(
+    (request) => request.requestStatusId === STATUS.REQUEST_ACCEPTED
+  );
 
   async function handleAvailability(statusId: number) {
     if (!driver) {
@@ -1059,16 +1683,15 @@ export function DriverHomeScreen() {
       let longitude: number | undefined;
 
       if (statusId === STATUS.AVAILABILITY_ONLINE) {
-        const permission = await Location.requestForegroundPermissionsAsync();
+        const result = await getCurrentDevicePlace({ requestPermission: true });
 
-        if (permission.status !== "granted") {
-          Alert.alert("Location needed", "Enable location to share your position.");
+        if (result.status !== "granted") {
+          Alert.alert("Location needed", result.message);
           return;
         }
 
-        const location = await Location.getCurrentPositionAsync({});
-        latitude = location.coords.latitude;
-        longitude = location.coords.longitude;
+        latitude = result.place.latitude;
+        longitude = result.place.longitude;
       }
 
       await updateDriverAvailability({
@@ -1077,9 +1700,19 @@ export function DriverHomeScreen() {
         latitude,
         longitude,
       });
+
+      if (typeof latitude === "number" && typeof longitude === "number") {
+        await recordDriverLocationUpdate({
+          driverProfileId: driver.id,
+          latitude,
+          longitude,
+          transportRequestId: acceptedRequest?.id ?? null,
+        });
+      }
+
       await resource.refresh();
     } catch (error) {
-      Alert.alert("Availability update failed", error instanceof Error ? error.message : "Try again.");
+      Alert.alert("Availability update failed", friendlyAppError(error));
     } finally {
       setIsUpdating(false);
     }
@@ -1110,7 +1743,19 @@ export function DriverHomeScreen() {
               value={getAvailabilityStatus(driver.availabilityStatusId).label}
             />
           </View>
-          <RouteMap drivers={[driver]} />
+          <RouteMap
+            drivers={[driver]}
+            pickup={
+              typeof driver.currentLatitude === "number" &&
+              typeof driver.currentLongitude === "number"
+                ? {
+                    latitude: driver.currentLatitude,
+                    longitude: driver.currentLongitude,
+                  }
+                : null
+            }
+            pickupName="Your shared location"
+          />
           <View className="rounded-2xl border border-divider bg-surface p-4">
             <SectionTitle title="Availability" />
             <View className="mt-4 flex-row gap-3">
@@ -1143,16 +1788,45 @@ export function DriverRouteScreen() {
   );
   const driver = resource.data?.driver ?? null;
   const canOperate = driver?.verificationStatusId === STATUS.VERIFICATION_APPROVED;
-  const [startName, setStartName] = useState<string>(PLACES.pickup.name);
-  const [destinationName, setDestinationName] = useState<string>(PLACES.destination.name);
+  const [startName, setStartName] = useState("");
+  const [destinationName, setDestinationName] = useState("");
+  const [startPlace, setStartPlace] = useState<PlaceSelection | null>(null);
+  const [destinationPlace, setDestinationPlace] = useState<PlaceSelection | null>(null);
   const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
     if (driver?.activeRoute) {
-      setStartName(driver.activeRoute.start_name ?? PLACES.pickup.name);
-      setDestinationName(driver.activeRoute.destination_name ?? PLACES.destination.name);
+      const activeStart = {
+        latitude: driver.activeRoute.start_latitude,
+        longitude: driver.activeRoute.start_longitude,
+        name: driver.activeRoute.start_name ?? "Route start",
+        source: "google" as const,
+      };
+      const activeDestination = {
+        latitude: driver.activeRoute.destination_latitude,
+        longitude: driver.activeRoute.destination_longitude,
+        name: driver.activeRoute.destination_name ?? "Route destination",
+        source: "google" as const,
+      };
+
+      setStartName(activeStart.name);
+      setDestinationName(activeDestination.name);
+      setStartPlace(activeStart);
+      setDestinationPlace(activeDestination);
     }
   }, [driver?.activeRoute]);
+
+  async function useCurrentRouteStart() {
+    const result = await getCurrentDevicePlace({ requestPermission: true });
+
+    if (result.status !== "granted") {
+      Alert.alert("Location needed", result.message);
+      return;
+    }
+
+    setStartPlace(result.place);
+    setStartName(result.place.name);
+  }
 
   async function handleSaveRoute() {
     if (!driver) {
@@ -1164,8 +1838,11 @@ export function DriverRouteScreen() {
       return;
     }
 
-    if (!startName.trim() || !destinationName.trim()) {
-      Alert.alert("Route needed", "Enter both start and destination.");
+    if (!startPlace || !destinationPlace) {
+      Alert.alert(
+        "Mapped route needed",
+        "Choose a start and destination from Google Maps or use Find address before saving."
+      );
       return;
     }
 
@@ -1174,13 +1851,13 @@ export function DriverRouteScreen() {
     try {
       await saveDriverRoute({
         driverProfileId: driver.id,
-        startName,
-        destinationName,
+        start: toRoutePoint(startPlace),
+        destination: toRoutePoint(destinationPlace),
       });
       await resource.refresh();
       Alert.alert("Route active", "Passengers can now match with this route.");
     } catch (error) {
-      Alert.alert("Route save failed", error instanceof Error ? error.message : "Try again.");
+      Alert.alert("Route save failed", friendlyAppError(error));
     } finally {
       setIsSaving(false);
     }
@@ -1198,20 +1875,27 @@ export function DriverRouteScreen() {
       <VerificationBanner driver={driver} />
       <View className="rounded-2xl border border-divider bg-surface p-4">
         <Text className="font-jakarta-bold text-base text-text">Create new route</Text>
-        <TextInput
-          value={startName}
-          onChangeText={setStartName}
-          placeholder="Start location"
-          placeholderTextColor={colors.textSecondary}
-          className="mt-4 h-12 rounded-xl border border-divider bg-background px-4 font-jakarta text-text"
-        />
-        <TextInput
-          value={destinationName}
-          onChangeText={setDestinationName}
-          placeholder="Destination"
-          placeholderTextColor={colors.textSecondary}
-          className="mt-3 h-12 rounded-xl border border-divider bg-background px-4 font-jakarta text-text"
-        />
+        <View className="mt-4 gap-4">
+          <PlaceInput
+            label="Start location"
+            onSelect={(place, typedValue) => {
+              setStartPlace(place);
+              setStartName(typedValue);
+            }}
+            onUseCurrentLocation={useCurrentRouteStart}
+            placeholder="Where will you start?"
+            value={startName}
+          />
+          <PlaceInput
+            label="Destination"
+            onSelect={(place, typedValue) => {
+              setDestinationPlace(place);
+              setDestinationName(typedValue);
+            }}
+            placeholder="Where are you heading?"
+            value={destinationName}
+          />
+        </View>
         <View className="mt-4 flex-row">
           <PrimaryButton
             disabled={!canOperate}
@@ -1221,7 +1905,27 @@ export function DriverRouteScreen() {
           />
         </View>
       </View>
-      <RouteMap drivers={driver ? [driver] : []} pickupName={startName} destinationName={destinationName} />
+      <RouteMap
+        destination={
+          destinationPlace
+            ? {
+                latitude: destinationPlace.latitude,
+                longitude: destinationPlace.longitude,
+              }
+            : null
+        }
+        destinationName={destinationPlace?.name ?? (destinationName || "Destination")}
+        drivers={driver ? [driver] : []}
+        pickup={
+          startPlace
+            ? {
+                latitude: startPlace.latitude,
+                longitude: startPlace.longitude,
+              }
+            : null
+        }
+        pickupName={startPlace?.name ?? (startName || "Start")}
+      />
       {driver?.activeRoute ? (
         <View className="rounded-2xl border border-divider bg-surface p-4">
           <SectionTitle title="Active route" />
@@ -1253,14 +1957,59 @@ export function DriverRequestsScreen() {
   const canRespond = driver?.verificationStatusId === STATUS.VERIFICATION_APPROVED;
   const [updatingId, setUpdatingId] = useState<string | null>(null);
 
+  async function shareRequestLocation(requestId: string) {
+    if (!driver) {
+      return;
+    }
+
+    setUpdatingId(requestId);
+
+    try {
+      const result = await getCurrentDevicePlace({ requestPermission: true });
+
+      if (result.status !== "granted") {
+        Alert.alert("Location needed", result.message);
+        return;
+      }
+
+      await recordDriverLocationUpdate({
+        driverProfileId: driver.id,
+        latitude: result.place.latitude,
+        longitude: result.place.longitude,
+        transportRequestId: requestId,
+      });
+      await resource.refresh();
+    } catch (error) {
+      Alert.alert("Location update failed", friendlyAppError(error));
+    } finally {
+      setUpdatingId(null);
+    }
+  }
+
   async function respond(requestId: string, statusId: number) {
     setUpdatingId(requestId);
 
     try {
       await updateTransportRequestStatus(requestId, statusId);
+
+      if (statusId === STATUS.REQUEST_ACCEPTED && driver) {
+        const result = await getCurrentDevicePlace({ requestPermission: true });
+
+        if (result.status === "granted") {
+          await recordDriverLocationUpdate({
+            driverProfileId: driver.id,
+            latitude: result.place.latitude,
+            longitude: result.place.longitude,
+            transportRequestId: requestId,
+          });
+        } else {
+          Alert.alert("Location needed", result.message);
+        }
+      }
+
       await resource.refresh();
     } catch (error) {
-      Alert.alert("Request update failed", error instanceof Error ? error.message : "Try again.");
+      Alert.alert("Request update failed", friendlyAppError(error));
     } finally {
       setUpdatingId(null);
     }
@@ -1293,6 +2042,11 @@ export function DriverRequestsScreen() {
             onReject={
               request.requestStatusId === STATUS.REQUEST_PENDING
                 ? () => respond(request.id, STATUS.REQUEST_REJECTED)
+                : undefined
+            }
+            onShareLocation={
+              request.requestStatusId === STATUS.REQUEST_ACCEPTED
+                ? () => shareRequestLocation(request.id)
                 : undefined
             }
           />
@@ -1663,10 +2417,11 @@ export function ProfileScreen() {
     () =>
       profile?.role_id === STATUS.ROLE_DRIVER
         ? getDriverDashboard(profile?.id ?? "")
-        : Promise.resolve({ driver: null, requests: [], reports: [] }),
+        : Promise.resolve({ driver: null, requests: [], reports: [], verification: null }),
     [profile?.id, profile?.role_id]
   );
   const driver = driverResource.data?.driver ?? null;
+  const verification = driverResource.data?.verification ?? null;
   const role =
     profile?.role_id === STATUS.ROLE_ADMIN
       ? "Administrator"
@@ -1777,6 +2532,14 @@ export function ProfileScreen() {
         </View>
       </View>
 
+      {driver ? (
+        <DriverVerificationPanel
+          driver={driver}
+          verification={verification}
+          onSubmitted={driverResource.refresh}
+        />
+      ) : null}
+
       <View className="rounded-2xl border border-divider bg-surface p-4">
         <SectionTitle
           title="Profile management"
@@ -1819,7 +2582,7 @@ export function ProfileScreen() {
             <TextInput
               value={city}
               onChangeText={setCity}
-              placeholder="Buea"
+              placeholder="City"
               placeholderTextColor={colors.textSecondary}
               className="h-12 rounded-xl border border-divider bg-background px-4 font-jakarta text-text"
             />

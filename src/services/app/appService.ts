@@ -1,5 +1,5 @@
-import { supabase } from "../supabase/client";
 import type { Profile } from "../../types/auth";
+import { supabase } from "../supabase/client";
 
 export const STATUS = {
   ACCOUNT_ACTIVE: 1000,
@@ -28,23 +28,18 @@ export const STATUS = {
   ROLE_ADMIN: 3000,
 } as const;
 
-export const PLACES = {
-  pickup: {
-    name: "Molyko, Buea",
-    latitude: 4.1538,
-    longitude: 9.292,
-  },
-  destination: {
-    name: "Mile 17, Buea",
-    latitude: 4.1519,
-    longitude: 9.2781,
-  },
-  driver: {
-    name: "Clerks Quarters, Buea",
-    latitude: 4.1581,
-    longitude: 9.2864,
-  },
-} as const;
+export const REPORT_TYPES = [
+  { id: 1000, label: "Safety issue" },
+  { id: 2000, label: "Driver or passenger behaviour" },
+  { id: 3000, label: "Wrong route or vehicle information" },
+  { id: 4000, label: "Other concern" },
+] as const;
+
+export type RoutePointInput = {
+  latitude: number;
+  longitude: number;
+  name: string;
+};
 
 type DriverProfileRow = {
   id: string;
@@ -115,6 +110,19 @@ type ReportRow = {
   created_at: string;
 };
 
+type DriverVerificationRow = {
+  id: string;
+  driver_profile_id: string;
+  verification_status_id: number;
+  document_url: string | null;
+  submitted_at: string;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+  rejection_reason: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type DriverSummary = {
   id: string;
   profileId: string;
@@ -123,8 +131,8 @@ export type DriverSummary = {
   avatarUrl: string | null;
   availabilityStatusId: number;
   verificationStatusId: number;
-  currentLatitude: number;
-  currentLongitude: number;
+  currentLatitude: number | null;
+  currentLongitude: number | null;
   lastLocationAt: string | null;
   vehicleId: string | null;
   vehicleTypeId: number | null;
@@ -133,6 +141,8 @@ export type DriverSummary = {
   vehicleLabel: string;
   plateNumber: string | null;
   activeRoute: DriverRouteRow | null;
+  distanceToPickupKm?: number;
+  routeAlignmentScore?: number;
 };
 
 export type TransportRequestSummary = {
@@ -152,6 +162,8 @@ export type TransportRequestSummary = {
   requestStatusId: number;
   passengerNote: string | null;
   requestedAt: string;
+  driverCurrentLatitude: number | null;
+  driverCurrentLongitude: number | null;
 };
 
 export type ReportSummary = {
@@ -165,6 +177,15 @@ export type ReportSummary = {
   createdAt: string;
 };
 
+export type DriverVerificationSummary = {
+  id: string;
+  documentUrl: string | null;
+  rejectionReason: string | null;
+  reviewedAt: string | null;
+  statusId: number;
+  submittedAt: string;
+};
+
 export type PassengerDashboardData = {
   availableDrivers: DriverSummary[];
   requests: TransportRequestSummary[];
@@ -175,6 +196,7 @@ export type DriverDashboardData = {
   driver: DriverSummary | null;
   requests: TransportRequestSummary[];
   reports: ReportSummary[];
+  verification: DriverVerificationSummary | null;
 };
 
 export type AdminDashboardData = {
@@ -218,14 +240,25 @@ function vehicleName(vehicle?: VehicleRow) {
   return model ? `${type} - ${model}` : type;
 }
 
-function fallbackCoordinate(value: number | null, fallback: number) {
-  return typeof value === "number" ? value : fallback;
-}
-
 function formatError(error: { message: string } | null) {
   if (error) {
     throw new Error(error.message);
   }
+}
+
+function distanceKm(a: { latitude: number; longitude: number }, b: { latitude: number; longitude: number }) {
+  const toRadians = (value: number) => (value * Math.PI) / 180;
+  const radiusKm = 6371;
+  const dLat = toRadians(b.latitude - a.latitude);
+  const dLon = toRadians(b.longitude - a.longitude);
+  const lat1 = toRadians(a.latitude);
+  const lat2 = toRadians(b.latitude);
+
+  const haversine =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.sin(dLon / 2) * Math.sin(dLon / 2) * Math.cos(lat1) * Math.cos(lat2);
+
+  return radiusKm * 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
 }
 
 async function countRows(table: string, filters?: (query: any) => any) {
@@ -302,8 +335,8 @@ async function enrichDrivers(rows: DriverProfileRow[]) {
       avatarUrl: profile?.avatar_url ?? null,
       availabilityStatusId: row.availability_status_id,
       verificationStatusId: row.verification_status_id,
-      currentLatitude: fallbackCoordinate(row.current_latitude, PLACES.driver.latitude),
-      currentLongitude: fallbackCoordinate(row.current_longitude, PLACES.driver.longitude),
+      currentLatitude: row.current_latitude,
+      currentLongitude: row.current_longitude,
       lastLocationAt: row.last_location_at,
       vehicleId: vehicle?.id ?? null,
       vehicleTypeId: vehicle?.vehicle_type_id ?? null,
@@ -319,6 +352,7 @@ async function enrichDrivers(rows: DriverProfileRow[]) {
 export async function listDrivers(options?: {
   approvedOnly?: boolean;
   onlineOnly?: boolean;
+  withLocationOnly?: boolean;
   limit?: number;
 }) {
   let query = supabase
@@ -335,9 +369,101 @@ export async function listDrivers(options?: {
     query = query.eq("availability_status_id", STATUS.AVAILABILITY_ONLINE);
   }
 
+  if (options?.withLocationOnly) {
+    query = query
+      .not("current_latitude", "is", null)
+      .not("current_longitude", "is", null);
+  }
+
   const { data, error } = await query;
   formatError(error);
   return enrichDrivers((data ?? []) as DriverProfileRow[]);
+}
+
+function scoreRouteMatch(driver: DriverSummary, pickup: RoutePointInput, destination: RoutePointInput) {
+  if (typeof driver.currentLatitude !== "number" || typeof driver.currentLongitude !== "number") {
+    return null;
+  }
+
+  const distanceToPickupKm = distanceKm(
+    { latitude: driver.currentLatitude, longitude: driver.currentLongitude },
+    pickup
+  );
+
+  if (!driver.activeRoute) {
+    return distanceToPickupKm <= 5
+      ? {
+          distanceToPickupKm,
+          routeAlignmentScore: Math.max(30, 65 - distanceToPickupKm * 8),
+        }
+      : null;
+  }
+
+  const startDistanceKm = distanceKm(
+    {
+      latitude: driver.activeRoute.start_latitude,
+      longitude: driver.activeRoute.start_longitude,
+    },
+    pickup
+  );
+  const destinationDistanceKm = distanceKm(
+    {
+      latitude: driver.activeRoute.destination_latitude,
+      longitude: driver.activeRoute.destination_longitude,
+    },
+    destination
+  );
+
+  if (distanceToPickupKm > 25 || startDistanceKm > 18 || destinationDistanceKm > 25) {
+    return null;
+  }
+
+  const score = Math.max(
+    0,
+    Math.min(100, 100 - distanceToPickupKm * 3 - startDistanceKm * 2 - destinationDistanceKm * 2)
+  );
+
+  return {
+    distanceToPickupKm,
+    routeAlignmentScore: Math.round(score * 100) / 100,
+  };
+}
+
+export async function listRouteMatchedDrivers(input: {
+  destination: RoutePointInput;
+  limit?: number;
+  pickup: RoutePointInput;
+}) {
+  const drivers = await listDrivers({
+    approvedOnly: true,
+    onlineOnly: true,
+    withLocationOnly: true,
+    limit: 100,
+  });
+  const matchedDrivers: DriverSummary[] = [];
+
+  for (const driver of drivers) {
+    const match = scoreRouteMatch(driver, input.pickup, input.destination);
+
+    if (match) {
+      matchedDrivers.push({
+        ...driver,
+        ...match,
+      });
+    }
+  }
+
+  return matchedDrivers
+    .sort((a, b) => {
+      const scoreDelta = (b.routeAlignmentScore ?? 0) - (a.routeAlignmentScore ?? 0);
+
+      if (scoreDelta !== 0) {
+        return scoreDelta;
+      }
+
+      return (a.distanceToPickupKm ?? 0) - (b.distanceToPickupKm ?? 0);
+    })
+    .slice(0, input.limit ?? 12);
 }
 
 export async function getDriverForProfile(profileId: string) {
@@ -355,6 +481,33 @@ export async function getDriverForProfile(profileId: string) {
 
   const [driver] = await enrichDrivers([data as DriverProfileRow]);
   return driver ?? null;
+}
+
+async function getDriverVerification(driverProfileId: string) {
+  const { data, error } = await supabase
+    .from("driver_verifications")
+    .select("*")
+    .eq("driver_profile_id", driverProfileId)
+    .order("submitted_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  formatError(error);
+
+  if (!data) {
+    return null;
+  }
+
+  const row = data as DriverVerificationRow;
+
+  return {
+    id: row.id,
+    documentUrl: row.document_url,
+    rejectionReason: row.rejection_reason,
+    reviewedAt: row.reviewed_at,
+    statusId: row.verification_status_id,
+    submittedAt: row.submitted_at,
+  };
 }
 
 async function enrichRequests(rows: TransportRequestRow[]) {
@@ -389,6 +542,8 @@ async function enrichRequests(rows: TransportRequestRow[]) {
       requestStatusId: row.request_status_id,
       passengerNote: row.passenger_note,
       requestedAt: row.requested_at,
+      driverCurrentLatitude: driver?.currentLatitude ?? null,
+      driverCurrentLongitude: driver?.currentLongitude ?? null,
     };
   });
 }
@@ -466,6 +621,7 @@ export async function getPassengerDashboard(profileId: string): Promise<Passenge
     listDrivers({
       approvedOnly: true,
       onlineOnly: true,
+      withLocationOnly: true,
       limit: 20,
     }),
     listPassengerRequests(profileId),
@@ -477,12 +633,13 @@ export async function getPassengerDashboard(profileId: string): Promise<Passenge
 
 export async function getDriverDashboard(profileId: string): Promise<DriverDashboardData> {
   const driver = await getDriverForProfile(profileId);
-  const [requests, reports] = await Promise.all([
+  const [requests, reports, verification] = await Promise.all([
     driver ? listDriverRequests(driver.id) : Promise.resolve([]),
     listReportsForUser(profileId),
+    driver ? getDriverVerification(driver.id) : Promise.resolve(null),
   ]);
 
-  return { driver, requests, reports };
+  return { driver, requests, reports, verification };
 }
 
 export async function getAdminDashboard(): Promise<AdminDashboardData> {
@@ -528,23 +685,23 @@ export async function getAdminDashboard(): Promise<AdminDashboardData> {
 }
 
 export async function createTransportRequest(input: {
-  passengerId: string;
+  destination: RoutePointInput;
   driverProfileId: string;
-  pickupName: string;
-  destinationName: string;
+  passengerId: string;
   passengerNote?: string;
+  pickup: RoutePointInput;
 }) {
   const { data, error } = await supabase
     .from("transport_requests")
     .insert({
       passenger_id: input.passengerId,
       driver_profile_id: input.driverProfileId,
-      pickup_name: input.pickupName,
-      destination_name: input.destinationName,
-      pickup_latitude: PLACES.pickup.latitude,
-      pickup_longitude: PLACES.pickup.longitude,
-      destination_latitude: PLACES.destination.latitude,
-      destination_longitude: PLACES.destination.longitude,
+      pickup_name: input.pickup.name,
+      destination_name: input.destination.name,
+      pickup_latitude: input.pickup.latitude,
+      pickup_longitude: input.pickup.longitude,
+      destination_latitude: input.destination.latitude,
+      destination_longitude: input.destination.longitude,
       request_status_id: STATUS.REQUEST_PENDING,
       passenger_note: input.passengerNote?.trim() || null,
     })
@@ -552,6 +709,25 @@ export async function createTransportRequest(input: {
     .single();
 
   formatError(error);
+
+  const [driver] = await listDrivers({ limit: 100 }).then((drivers) =>
+    drivers.filter((item) => item.id === input.driverProfileId)
+  );
+  const match = driver ? scoreRouteMatch(driver, input.pickup, input.destination) : null;
+
+  if (driver) {
+    const { error: matchError } = await supabase.from("route_matches").insert({
+      request_id: data.id,
+      driver_profile_id: input.driverProfileId,
+      driver_route_id: driver.activeRoute?.id ?? null,
+      distance_to_pickup_m:
+        typeof match?.distanceToPickupKm === "number" ? match.distanceToPickupKm * 1000 : null,
+      route_alignment_score: match?.routeAlignmentScore ?? null,
+      is_selected: true,
+    });
+
+    formatError(matchError);
+  }
 
   const { data: driverProfile } = await supabase
     .from("driver_profiles")
@@ -564,7 +740,7 @@ export async function createTransportRequest(input: {
       recipient_id: driverProfile.profile_id,
       notification_type_id: 1000,
       title: "New ride request",
-      body: `${input.pickupName} to ${input.destinationName}`,
+      body: `${input.pickup.name} to ${input.destination.name}`,
       related_request_id: data.id,
     });
   }
@@ -603,6 +779,30 @@ export async function updateTransportRequestStatus(
     .eq("id", requestId);
 
   formatError(error);
+
+  if (statusId === STATUS.REQUEST_ACCEPTED || statusId === STATUS.REQUEST_REJECTED) {
+    const { data: request } = await supabase
+      .from("transport_requests")
+      .select("passenger_id,pickup_name,destination_name")
+      .eq("id", requestId)
+      .maybeSingle();
+
+    if (request?.passenger_id) {
+      await supabase.from("notifications").insert({
+        recipient_id: request.passenger_id,
+        notification_type_id:
+          statusId === STATUS.REQUEST_ACCEPTED ? 2000 : 3000,
+        title:
+          statusId === STATUS.REQUEST_ACCEPTED
+            ? "Request accepted"
+            : "Request rejected",
+        body: `${request.pickup_name ?? "Pickup"} to ${
+          request.destination_name ?? "destination"
+        }`,
+        related_request_id: requestId,
+      });
+    }
+  }
 }
 
 export async function updateDriverAvailability(input: {
@@ -625,6 +825,40 @@ export async function updateDriverAvailability(input: {
     .from("driver_profiles")
     .update(patch)
     .eq("id", input.driverProfileId);
+
+  formatError(error);
+}
+
+export async function recordDriverLocationUpdate(input: {
+  driverProfileId: string;
+  heading?: number | null;
+  latitude: number;
+  longitude: number;
+  speed?: number | null;
+  transportRequestId?: string | null;
+}) {
+  const now = new Date().toISOString();
+
+  const { error: profileError } = await supabase
+    .from("driver_profiles")
+    .update({
+      current_latitude: input.latitude,
+      current_longitude: input.longitude,
+      last_location_at: now,
+    })
+    .eq("id", input.driverProfileId);
+
+  formatError(profileError);
+
+  const { error } = await supabase.from("location_updates").insert({
+    driver_profile_id: input.driverProfileId,
+    transport_request_id: input.transportRequestId ?? null,
+    latitude: input.latitude,
+    longitude: input.longitude,
+    speed: input.speed ?? null,
+    heading: input.heading ?? null,
+    recorded_at: now,
+  });
 
   formatError(error);
 }
@@ -700,9 +934,9 @@ export async function updateUserAccountStatus(
 }
 
 export async function saveDriverRoute(input: {
+  destination: RoutePointInput;
   driverProfileId: string;
-  startName: string;
-  destinationName: string;
+  start: RoutePointInput;
 }) {
   await supabase
     .from("driver_routes")
@@ -717,12 +951,12 @@ export async function saveDriverRoute(input: {
     .from("driver_routes")
     .insert({
       driver_profile_id: input.driverProfileId,
-      start_name: input.startName.trim(),
-      destination_name: input.destinationName.trim(),
-      start_latitude: PLACES.pickup.latitude,
-      start_longitude: PLACES.pickup.longitude,
-      destination_latitude: PLACES.destination.latitude,
-      destination_longitude: PLACES.destination.longitude,
+      start_name: input.start.name.trim(),
+      destination_name: input.destination.name.trim(),
+      start_latitude: input.start.latitude,
+      start_longitude: input.start.longitude,
+      destination_latitude: input.destination.latitude,
+      destination_longitude: input.destination.longitude,
       route_status_id: STATUS.ROUTE_ACTIVE,
     })
     .select("*")
@@ -761,6 +995,55 @@ export async function updateDriverVerification(
       reviewed_at: new Date().toISOString(),
     })
     .eq("driver_profile_id", driverProfileId);
+}
+
+export async function submitDriverVerification(input: {
+  documentUrl: string;
+  driverProfileId: string;
+}) {
+  const cleanDocumentUrl = input.documentUrl.trim();
+
+  if (!cleanDocumentUrl) {
+    throw new Error("Add a document link before submitting verification.");
+  }
+
+  const { data: existing, error: lookupError } = await supabase
+    .from("driver_verifications")
+    .select("id")
+    .eq("driver_profile_id", input.driverProfileId)
+    .limit(1);
+
+  formatError(lookupError);
+
+  const payload = {
+    document_url: cleanDocumentUrl,
+    verification_status_id: STATUS.VERIFICATION_PENDING,
+    rejection_reason: null,
+    reviewed_at: null,
+    submitted_at: new Date().toISOString(),
+  };
+  const query = existing?.[0]?.id
+    ? supabase
+        .from("driver_verifications")
+        .update(payload)
+        .eq("id", existing[0].id)
+    : supabase.from("driver_verifications").insert({
+        ...payload,
+        driver_profile_id: input.driverProfileId,
+      });
+
+  const { error } = await query;
+  formatError(error);
+
+  const { error: driverError } = await supabase
+    .from("driver_profiles")
+    .update({
+      verification_status_id: STATUS.VERIFICATION_PENDING,
+      availability_status_id: STATUS.AVAILABILITY_OFFLINE,
+    })
+    .eq("id", input.driverProfileId);
+
+  formatError(driverError);
 }
 
 export async function createReport(input: {

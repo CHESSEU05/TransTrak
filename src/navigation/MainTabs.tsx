@@ -11,6 +11,7 @@ import {
   User,
   Users,
 } from "lucide-react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { colors } from "../constants/colors";
 import { useAuth } from "../context/AuthContext";
@@ -56,8 +57,14 @@ type MainTabParamList = {
 const Tab = createBottomTabNavigator<MainTabParamList>();
 
 function FloatingTabBar({ descriptors, navigation, state }: BottomTabBarProps) {
+  const insets = useSafeAreaInsets();
+
   return (
-    <View pointerEvents="box-none" className="absolute bottom-4 left-4 right-4">
+    <View
+      pointerEvents="box-none"
+      className="absolute left-4 right-4"
+      style={{ bottom: Math.max(insets.bottom + 14, 30) }}
+    >
       <View
         className="flex-row items-center justify-around rounded-full border border-divider bg-surface px-2 py-2"
         style={{
