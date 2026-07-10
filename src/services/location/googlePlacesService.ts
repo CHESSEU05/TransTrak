@@ -6,6 +6,13 @@ export type PlacePrediction = {
   name: string;
 };
 
+export type RouteMetrics = {
+  coordinates: Coordinates[];
+  distanceMeters: number;
+  durationSeconds: number;
+  encodedPolyline: string | null;
+};
+
 type GoogleAutocompleteSuggestion = {
   placePrediction?: {
     placeId?: string;
@@ -36,7 +43,8 @@ type GooglePlaceDetails = {
 
 const GOOGLE_PLACES_BASE_URL = "https://places.googleapis.com/v1";
 const GOOGLE_GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json";
-const CAMEROON_CENTER = { latitude: 5.7609, longitude: 12.7396 };
+const GOOGLE_ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes";
+const LOCATION_BIAS_RADIUS_METERS = 40000;
 
 function apiKey() {
   return process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY?.trim() ?? "";
@@ -76,17 +84,63 @@ async function parseGoogleError(response: Response) {
 }
 
 function locationBias(origin?: Coordinates) {
-  const center = origin ?? CAMEROON_CENTER;
+  if (!origin) {
+    return null;
+  }
 
   return {
     circle: {
       center: {
-        latitude: center.latitude,
-        longitude: center.longitude,
+        latitude: origin.latitude,
+        longitude: origin.longitude,
       },
-      radius: origin ? 40000 : 900000,
+      radius: LOCATION_BIAS_RADIUS_METERS,
     },
   };
+}
+
+export function decodeRoutePolyline(encoded: string) {
+  const coordinates: Coordinates[] = [];
+  let index = 0;
+  let latitude = 0;
+  let longitude = 0;
+
+  while (index < encoded.length) {
+    let shift = 0;
+    let result = 0;
+    let byte: number;
+
+    do {
+      byte = encoded.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift += 5;
+    } while (byte >= 0x20);
+
+    latitude += result & 1 ? ~(result >> 1) : result >> 1;
+    shift = 0;
+    result = 0;
+
+    do {
+      byte = encoded.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift += 5;
+    } while (byte >= 0x20);
+
+    longitude += result & 1 ? ~(result >> 1) : result >> 1;
+
+    coordinates.push({
+      latitude: latitude / 100000,
+      longitude: longitude / 100000,
+    });
+  }
+
+  return coordinates;
+}
+
+function parseDurationSeconds(duration?: string) {
+  const match = duration?.match(/^(\d+(?:\.\d+)?)s$/);
+
+  return match ? Math.round(Number(match[1])) : 0;
 }
 
 export async function searchPlacePredictions(input: string, origin?: Coordinates) {
@@ -96,6 +150,12 @@ export async function searchPlacePredictions(input: string, origin?: Coordinates
     return [];
   }
 
+  const requestBody = {
+    includedRegionCodes: ["cm"],
+    input: trimmed,
+    ...(origin ? { locationBias: locationBias(origin) } : {}),
+  };
+
   const response = await fetch(`${GOOGLE_PLACES_BASE_URL}/places:autocomplete`, {
     method: "POST",
     headers: {
@@ -104,11 +164,7 @@ export async function searchPlacePredictions(input: string, origin?: Coordinates
       "X-Goog-FieldMask":
         "suggestions.placePrediction.placeId,suggestions.placePrediction.text.text,suggestions.placePrediction.structuredFormat.mainText.text,suggestions.placePrediction.structuredFormat.secondaryText.text",
     },
-    body: JSON.stringify({
-      includedRegionCodes: ["cm"],
-      input: trimmed,
-      locationBias: locationBias(origin),
-    }),
+    body: JSON.stringify(requestBody),
   });
 
   if (!response.ok) {
@@ -217,5 +273,73 @@ export async function geocodeAddress(input: string): Promise<PlaceSelection> {
     address: result?.formatted_address ?? null,
     name: result?.formatted_address ?? trimmed,
     source: "google",
+  };
+}
+
+export async function computeRouteMetrics(input: {
+  destination: Coordinates;
+  origin: Coordinates;
+}): Promise<RouteMetrics | null> {
+  if (!isGooglePlacesConfigured()) {
+    return null;
+  }
+
+  const response = await fetch(GOOGLE_ROUTES_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": ensureApiKey(),
+      "X-Goog-FieldMask": "routes.distanceMeters,routes.duration,routes.polyline.encodedPolyline",
+    },
+    body: JSON.stringify({
+      computeAlternativeRoutes: false,
+      destination: {
+        location: {
+          latLng: {
+            latitude: input.destination.latitude,
+            longitude: input.destination.longitude,
+          },
+        },
+      },
+      origin: {
+        location: {
+          latLng: {
+            latitude: input.origin.latitude,
+            longitude: input.origin.longitude,
+          },
+        },
+      },
+      routingPreference: "TRAFFIC_AWARE",
+      travelMode: "DRIVE",
+      units: "METRIC",
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error((await parseGoogleError(response)) ?? "Unable to compute this route.");
+  }
+
+  const body = (await response.json()) as {
+    routes?: {
+      distanceMeters?: number;
+      duration?: string;
+      polyline?: {
+        encodedPolyline?: string;
+      };
+    }[];
+  };
+  const route = body.routes?.[0];
+
+  if (!route) {
+    return null;
+  }
+
+  const encodedPolyline = route.polyline?.encodedPolyline ?? null;
+
+  return {
+    coordinates: encodedPolyline ? decodeRoutePolyline(encodedPolyline) : [input.origin, input.destination],
+    distanceMeters: route.distanceMeters ?? 0,
+    durationSeconds: parseDurationSeconds(route.duration),
+    encodedPolyline,
   };
 }

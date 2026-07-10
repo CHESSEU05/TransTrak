@@ -16,14 +16,17 @@ import {
   AlertTriangle,
   Bike,
   Car,
+  ChevronRight,
   CheckCircle2,
   ClipboardList,
   Clock3,
   Edit3,
   FileText,
   FileUp,
+  HelpCircle,
   Info,
   LocateFixed,
+  LockKeyhole,
   MapPin,
   Navigation,
   Phone,
@@ -31,12 +34,15 @@ import {
   RefreshCw,
   Search,
   ShieldCheck,
+  SlidersHorizontal,
+  ScrollText,
   UserRound,
   Users,
   X,
 } from "lucide-react-native";
 import type { LucideIcon } from "lucide-react-native";
 import { useNavigation } from "@react-navigation/native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { RouteMap } from "../../components/maps/RouteMap";
 import { colors } from "../../constants/colors";
@@ -69,12 +75,16 @@ import type {
   TransportRequestSummary,
 } from "../../services/app/appService";
 import {
+  computeRouteMetrics,
+  decodeRoutePolyline,
   geocodeAddress,
   getPlaceDetails,
   isGooglePlacesConfigured,
+  type RouteMetrics,
   searchPlacePredictions,
 } from "../../services/location/googlePlacesService";
 import { getCurrentDevicePlace, type PlaceSelection } from "../../services/location/locationService";
+import { supabase } from "../../services/supabase/client";
 import type { Profile } from "../../types/auth";
 
 type ResourceState<T> = {
@@ -127,6 +137,44 @@ function useAsyncResource<T>(
   }, [refresh]);
 
   return { ...state, refresh };
+}
+
+function useRealtimeRefresh(topics: (string | null | undefined)[], refresh: () => Promise<void>) {
+  const uniqueTopics = Array.from(new Set(topics.filter((topic): topic is string => Boolean(topic))));
+  const topicKey = uniqueTopics.join("|");
+
+  useEffect(() => {
+    if (uniqueTopics.length === 0) {
+      return undefined;
+    }
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const channels = uniqueTopics.map((topic) =>
+      supabase
+        .channel(topic, { config: { private: true } })
+        .on("broadcast", { event: "*" }, () => {
+          if (timer) {
+            clearTimeout(timer);
+          }
+
+          timer = setTimeout(() => {
+            refresh();
+          }, 250);
+        })
+        .subscribe()
+    );
+
+    return () => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+
+      channels.forEach((channel) => {
+        supabase.removeChannel(channel);
+      });
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refresh, topicKey]);
 }
 
 function firstName(name?: string | null) {
@@ -221,6 +269,10 @@ function roleLabel(roleId: number) {
   return "Passenger";
 }
 
+function reportTypeLabel(typeId: number) {
+  return REPORT_TYPES.find((type) => type.id === typeId)?.label ?? "Other concern";
+}
+
 function normalizePhone(value: string) {
   return value.replace(/\D/g, "");
 }
@@ -249,6 +301,105 @@ function toRoutePoint(place: PlaceSelection): RoutePointInput {
     longitude: place.longitude,
     name: place.name,
   };
+}
+
+function toCoordinate(place?: PlaceSelection | null) {
+  return place
+    ? {
+        latitude: place.latitude,
+        longitude: place.longitude,
+      }
+    : null;
+}
+
+function routeCoordinatesFromPolyline(polyline?: string | null) {
+  if (!polyline) {
+    return [];
+  }
+
+  try {
+    return decodeRoutePolyline(polyline);
+  } catch {
+    return [];
+  }
+}
+
+function formatDistanceMeters(value?: number | null) {
+  if (!value) {
+    return "--";
+  }
+
+  return value >= 1000 ? `${(value / 1000).toFixed(1)} km` : `${Math.round(value)} m`;
+}
+
+function formatDurationSeconds(value?: number | null) {
+  if (!value) {
+    return "--";
+  }
+
+  const minutes = Math.max(1, Math.round(value / 60));
+
+  if (minutes < 60) {
+    return `${minutes} min`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+
+  return remainder ? `${hours}h ${remainder}m` : `${hours}h`;
+}
+
+function RouteMetricsCard({ metrics }: { metrics: RouteMetrics | null }) {
+  if (!metrics) {
+    return null;
+  }
+
+  return (
+    <View className="gap-3 rounded-2xl border border-primary/20 bg-primarySoft p-3">
+      <View className="flex-row items-center justify-between">
+        <Text className="font-jakarta-bold text-sm text-primary">Google route preview</Text>
+        <StatusBadge bg={colors.infoSoft} color={colors.info} label="Traffic-aware" />
+      </View>
+      <View className="flex-row gap-3">
+      <View className="flex-1 rounded-xl bg-surface p-3">
+        <Text className="font-jakarta text-xs text-textSecondary">Distance</Text>
+        <Text className="mt-1 font-jakarta-bold text-base text-text">
+          {formatDistanceMeters(metrics.distanceMeters)}
+        </Text>
+      </View>
+      <View className="flex-1 rounded-xl bg-surface p-3">
+        <Text className="font-jakarta text-xs text-textSecondary">ETA</Text>
+        <Text className="mt-1 font-jakarta-bold text-base text-text">
+          {formatDurationSeconds(metrics.durationSeconds)}
+        </Text>
+      </View>
+      </View>
+    </View>
+  );
+}
+
+function MapLegend() {
+  const items = [
+    { label: "Pickup", color: colors.success },
+    { label: "Destination", color: colors.primary },
+    { label: "Taxi", color: colors.taxi },
+    { label: "Bike", color: colors.bike },
+    { label: "Busy", color: colors.warning },
+  ];
+
+  return (
+    <View className="flex-row flex-wrap gap-2 rounded-2xl border border-divider bg-surface px-3 py-3">
+      {items.map((item) => (
+        <View key={item.label} className="flex-row items-center rounded-full bg-background px-3 py-2">
+          <View
+            className="mr-2 h-2.5 w-2.5 rounded-full"
+            style={{ backgroundColor: item.color }}
+          />
+          <Text className="font-jakarta-bold text-xs text-textSecondary">{item.label}</Text>
+        </View>
+      ))}
+    </View>
+  );
 }
 
 function friendlyAppError(error: unknown, fallback = "Something went wrong. Please try again.") {
@@ -367,15 +518,19 @@ function useCurrentLocationOnDemand() {
 
 function PlaceInput({
   label,
+  onChangeText,
   onSelect,
   onUseCurrentLocation,
   placeholder,
+  selected,
   value,
 }: {
   label: string;
+  onChangeText?: (value: string) => void;
   onSelect: (place: PlaceSelection, typedValue: string) => void;
   onUseCurrentLocation?: () => Promise<void>;
   placeholder: string;
+  selected?: boolean;
   value: string;
 }) {
   const [text, setText] = useState(value);
@@ -393,7 +548,7 @@ function PlaceInput({
     let cancelled = false;
 
     async function loadPredictions() {
-      if (!text.trim() || text.trim() === value.trim()) {
+      if (!text.trim() || (selected && text.trim() === value.trim())) {
         setPredictions([]);
         setError(null);
         return;
@@ -425,7 +580,7 @@ function PlaceInput({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [text, value]);
+  }, [selected, text, value]);
 
   async function selectPrediction(placeId: string) {
     setLoading(true);
@@ -470,12 +625,21 @@ function PlaceInput({
         onChangeText={(nextText) => {
           setText(nextText);
           setError(null);
+          onChangeText?.(nextText);
         }}
         placeholder={placeholder}
         placeholderTextColor={colors.textSecondary}
-        className="mt-2 h-12 rounded-xl border border-divider bg-background px-4 font-jakarta text-text"
+        className={`mt-2 h-12 rounded-xl border bg-background px-4 font-jakarta text-text ${
+          selected ? "border-success" : "border-divider"
+        }`}
       />
       <View className="mt-2 flex-row flex-wrap gap-2">
+        {selected ? (
+          <View className="flex-row items-center rounded-full bg-success/10 px-3 py-2">
+            <CheckCircle2 color={colors.success} size={15} />
+            <Text className="ml-1 font-jakarta-bold text-xs text-success">Mapped</Text>
+          </View>
+        ) : null}
         {onUseCurrentLocation ? (
           <TouchableOpacity
             activeOpacity={0.8}
@@ -489,7 +653,7 @@ function PlaceInput({
         <TouchableOpacity
           activeOpacity={0.8}
           onPress={resolveTypedAddress}
-          className="flex-row items-center rounded-full bg-primary/10 px-3 py-2"
+          className="flex-row items-center rounded-full bg-accentSoft px-3 py-2"
         >
           <Search color={colors.primary} size={15} />
           <Text className="ml-1 font-jakarta-bold text-xs text-primary">Find address</Text>
@@ -510,10 +674,17 @@ function PlaceInput({
               onPress={() => selectPrediction(prediction.id)}
               className="border-b border-divider px-3 py-3"
             >
-              <Text className="font-jakarta-bold text-sm text-text">{prediction.name}</Text>
-              <Text className="mt-0.5 font-jakarta text-xs text-textSecondary">
-                {prediction.description}
-              </Text>
+              <View className="flex-row items-start">
+                <View className="mr-2 mt-0.5 h-7 w-7 items-center justify-center rounded-full bg-primary/10">
+                  <MapPin color={colors.primary} size={14} />
+                </View>
+                <View className="flex-1">
+                  <Text className="font-jakarta-bold text-sm text-text">{prediction.name}</Text>
+                  <Text className="mt-0.5 font-jakarta text-xs text-textSecondary">
+                    {prediction.description}
+                  </Text>
+                </View>
+              </View>
             </TouchableOpacity>
           ))}
         </View>
@@ -535,6 +706,8 @@ function ScreenShell({
   subtitle: string;
   title: string;
 }) {
+  const insets = useSafeAreaInsets();
+
   return (
     <View className="flex-1 bg-background p-safe">
       <KeyboardAvoidingView
@@ -542,7 +715,7 @@ function ScreenShell({
         className="flex-1"
       >
         <ScrollView
-          contentContainerStyle={{ paddingBottom: 116 }}
+          contentContainerStyle={{ paddingBottom: Math.max(insets.bottom + 166, 190) }}
           keyboardShouldPersistTaps="handled"
           refreshControl={
             onRefresh ? (
@@ -630,16 +803,30 @@ function StatusBadge({
 function StatCard({
   icon: Icon,
   label,
+  tone = "primary",
   value,
 }: {
   icon: LucideIcon;
   label: string;
+  tone?: "primary" | "success" | "warning" | "danger" | "info" | "violet";
   value: string;
 }) {
+  const palette = {
+    danger: { color: colors.danger, bg: colors.dangerSoft },
+    info: { color: colors.info, bg: colors.infoSoft },
+    primary: { color: colors.primary, bg: colors.primarySoft },
+    success: { color: colors.success, bg: colors.successSoft },
+    violet: { color: colors.violet, bg: colors.violetSoft },
+    warning: { color: colors.warning, bg: colors.warningSoft },
+  }[tone];
+
   return (
     <View className="flex-1 rounded-2xl border border-divider bg-surface p-4">
-      <View className="mb-3 h-9 w-9 items-center justify-center rounded-full bg-primary/10">
-        <Icon color={colors.primary} size={18} />
+      <View
+        className="mb-3 h-9 w-9 items-center justify-center rounded-full"
+        style={{ backgroundColor: palette.bg }}
+      >
+        <Icon color={palette.color} size={18} />
       </View>
       <Text className="font-jakarta text-xs text-textSecondary">{label}</Text>
       <Text className="mt-1 font-jakarta-bold text-xl text-text">{value}</Text>
@@ -667,10 +854,11 @@ function PrimaryButton({
   label: string;
   loading?: boolean;
   onPress: () => void;
-  tone?: "primary" | "danger" | "outline";
+  tone?: "primary" | "danger" | "outline" | "warning";
 }) {
   const isOutline = tone === "outline";
-  const bg = tone === "danger" ? colors.danger : colors.primary;
+  const bg =
+    tone === "danger" ? colors.danger : tone === "warning" ? colors.warning : colors.primary;
 
   return (
     <TouchableOpacity
@@ -701,17 +889,20 @@ function PrimaryButton({
 }
 
 function DriverCard({
+  canRequest = true,
   driver,
   onViewDetails,
   onRequest,
   requesting,
 }: {
+  canRequest?: boolean;
   driver: DriverSummary;
   onViewDetails?: () => void;
   onRequest?: () => void;
   requesting?: boolean;
 }) {
   const availability = getAvailabilityStatus(driver.availabilityStatusId);
+  const busy = driver.availabilityStatusId === STATUS.AVAILABILITY_BUSY;
 
   return (
     <View className="rounded-2xl border border-divider bg-surface p-4">
@@ -747,6 +938,11 @@ function DriverCard({
                 : ""}
             </Text>
           ) : null}
+          {busy ? (
+            <Text className="mt-1 font-jakarta-bold text-xs text-warning">
+              Nearby but busy right now
+            </Text>
+          ) : null}
         </View>
       </View>
       {onRequest || onViewDetails ? (
@@ -755,7 +951,12 @@ function DriverCard({
             <PrimaryButton label="View details" onPress={onViewDetails} tone="outline" />
           ) : null}
           {onRequest ? (
-            <PrimaryButton label="Send request" loading={requesting} onPress={onRequest} />
+            <PrimaryButton
+              disabled={!canRequest || busy}
+              label={busy ? "Busy" : "Send request"}
+              loading={requesting}
+              onPress={onRequest}
+            />
           ) : null}
         </View>
       ) : null}
@@ -764,11 +965,13 @@ function DriverCard({
 }
 
 function DriverDetailPanel({
+  canRequest = true,
   driver,
   onClose,
   onRequest,
   requesting,
 }: {
+  canRequest?: boolean;
   driver: DriverSummary;
   onClose: () => void;
   onRequest: () => void;
@@ -776,6 +979,7 @@ function DriverDetailPanel({
 }) {
   const availability = getAvailabilityStatus(driver.availabilityStatusId);
   const verification = getVerificationStatus(driver.verificationStatusId);
+  const busy = driver.availabilityStatusId === STATUS.AVAILABILITY_BUSY;
 
   return (
     <View className="rounded-2xl border border-primary bg-surface p-4">
@@ -855,13 +1059,81 @@ function DriverDetailPanel({
               : null
           }
           pickupName={driver.activeRoute?.start_name ?? "Pickup"}
+          routeCoordinates={routeCoordinatesFromPolyline(driver.activeRoute?.route_polyline)}
         />
       </View>
 
       <View className="mt-4 flex-row gap-3">
-        <PrimaryButton label="Send request" loading={requesting} onPress={onRequest} />
+        <PrimaryButton
+          disabled={!canRequest || busy}
+          label={busy ? "Driver busy" : "Send request"}
+          loading={requesting}
+          onPress={onRequest}
+        />
       </View>
     </View>
+  );
+}
+
+function RequestRouteMap({
+  drivers,
+  request,
+}: {
+  drivers: DriverSummary[];
+  request: TransportRequestSummary;
+}) {
+  const [routeCoordinates, setRouteCoordinates] = useState<RouteMetrics["coordinates"]>([]);
+
+  const pickup = {
+    latitude: request.pickupLatitude,
+    longitude: request.pickupLongitude,
+  };
+  const destination = {
+    latitude: request.destinationLatitude,
+    longitude: request.destinationLongitude,
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadRoute() {
+      try {
+        const metrics = await computeRouteMetrics({
+          origin: pickup,
+          destination,
+        });
+
+        if (!cancelled) {
+          setRouteCoordinates(metrics?.coordinates ?? []);
+        }
+      } catch {
+        if (!cancelled) {
+          setRouteCoordinates([]);
+        }
+      }
+    }
+
+    loadRoute();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    destination.latitude,
+    destination.longitude,
+    pickup.latitude,
+    pickup.longitude,
+  ]);
+
+  return (
+    <RouteMap
+      destination={destination}
+      destinationName={request.destinationName}
+      drivers={drivers}
+      pickup={pickup}
+      pickupName={request.pickupName}
+      routeCoordinates={routeCoordinates}
+    />
   );
 }
 
@@ -901,7 +1173,7 @@ function RequestCard({
           currentLongitude: request.driverCurrentLongitude,
           lastLocationAt: null,
           vehicleId: null,
-          vehicleTypeId: null,
+          vehicleTypeId: request.vehicleTypeId,
           vehicleStatusId: null,
           vehicleModel: null,
           vehicleLabel: request.vehicleLabel,
@@ -934,19 +1206,7 @@ function RequestCard({
       {request.requestStatusId === STATUS.REQUEST_ACCEPTED ||
       request.requestStatusId === STATUS.REQUEST_PENDING ? (
         <View className="mt-4">
-          <RouteMap
-            destination={{
-              latitude: request.destinationLatitude,
-              longitude: request.destinationLongitude,
-            }}
-            destinationName={request.destinationName}
-            drivers={mapDriver ? [mapDriver] : []}
-            pickup={{
-              latitude: request.pickupLatitude,
-              longitude: request.pickupLongitude,
-            }}
-            pickupName={request.pickupName}
-          />
+          <RequestRouteMap request={request} drivers={mapDriver ? [mapDriver] : []} />
         </View>
       ) : null}
       <View className="mt-4 flex-row gap-3">
@@ -1019,9 +1279,30 @@ function ReportCard({
         <StatusBadge {...status} />
       </View>
       <Text className="mt-3 font-jakarta text-sm text-text">{report.description}</Text>
+      <View className="mt-3 flex-row flex-wrap gap-2">
+        <StatusBadge
+          bg={colors.primarySoft}
+          color={colors.primary}
+          label={reportTypeLabel(report.reportTypeId)}
+        />
+        {report.transportRequestId ? (
+          <StatusBadge bg={colors.accentSoft} color={colors.accent} label="Trip linked" />
+        ) : null}
+      </View>
       <Text className="mt-2 font-jakarta text-xs text-textSecondary">
         {formatShortDate(report.createdAt)}
       </Text>
+      {report.resolutionNote ? (
+        <View className="mt-3 rounded-xl bg-successSoft p-3">
+          <Text className="font-jakarta-bold text-xs text-success">Admin resolution</Text>
+          <Text className="mt-1 font-jakarta text-sm text-text">{report.resolutionNote}</Text>
+          {report.resolvedAt ? (
+            <Text className="mt-1 font-jakarta text-xs text-textSecondary">
+              {formatShortDate(report.resolvedAt)}
+            </Text>
+          ) : null}
+        </View>
+      ) : null}
       {onResolve || onDismiss ? (
         <View className="mt-4 flex-row gap-3">
           {onResolve ? <PrimaryButton label="Resolve" onPress={onResolve} /> : null}
@@ -1189,14 +1470,24 @@ function DriverVerificationPanel({
 function ReportComposer({
   onSubmitted,
   reporterId,
+  requests,
+  role,
 }: {
   onSubmitted: () => Promise<void>;
   reporterId: string;
+  requests: TransportRequestSummary[];
+  role: "Passenger" | "Driver";
 }) {
   const [title, setTitle] = useState("Route issue");
   const [description, setDescription] = useState("");
   const [reportTypeId, setReportTypeId] = useState<number>(REPORT_TYPES[0].id);
+  const [selectedRequestId, setSelectedRequestId] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const selectedRequest = requests.find((request) => request.id === selectedRequestId) ?? null;
+  const reportedUserId =
+    role === "Passenger"
+      ? selectedRequest?.driverProfileUserId ?? null
+      : selectedRequest?.passengerId ?? null;
 
   async function handleSubmit() {
     if (!title.trim() || description.trim().length < 10) {
@@ -1209,11 +1500,14 @@ function ReportComposer({
     try {
       await createReport({
         reporterId,
+        reportedUserId: reportedUserId ?? undefined,
         reportTypeId,
+        transportRequestId: selectedRequest?.id,
         title,
         description,
       });
       setDescription("");
+      setSelectedRequestId(null);
       await onSubmitted();
       Alert.alert("Report submitted", "The administrator can now review this report.");
     } catch (error) {
@@ -1259,6 +1553,57 @@ function ReportComposer({
         placeholderTextColor={colors.textSecondary}
         className="mt-4 h-12 rounded-xl border border-divider bg-background px-4 font-jakarta text-text"
       />
+      <Text className="mt-4 font-jakarta-semibold text-sm text-text">
+        Related transport request
+      </Text>
+      <View className="mt-2 gap-2">
+        <TouchableOpacity
+          activeOpacity={0.8}
+          onPress={() => setSelectedRequestId(null)}
+          className={`rounded-xl border px-3 py-3 ${
+            selectedRequestId === null ? "border-primary bg-primarySoft" : "border-divider bg-background"
+          }`}
+        >
+          <Text className="font-jakarta-bold text-sm text-text">No related request</Text>
+          <Text className="mt-0.5 font-jakarta text-xs text-textSecondary">
+            Use this for account, platform, or general safety reports.
+          </Text>
+        </TouchableOpacity>
+        {requests.slice(0, 5).map((request) => {
+          const selected = selectedRequestId === request.id;
+
+          return (
+            <TouchableOpacity
+              key={request.id}
+              activeOpacity={0.8}
+              onPress={() => setSelectedRequestId(request.id)}
+              className={`rounded-xl border px-3 py-3 ${
+                selected ? "border-primary bg-primarySoft" : "border-divider bg-background"
+              }`}
+            >
+              <Text className="font-jakarta-bold text-sm text-text">
+                {request.pickupName} to {request.destinationName}
+              </Text>
+              <Text className="mt-0.5 font-jakarta text-xs text-textSecondary">
+                {role === "Passenger"
+                  ? `Driver: ${request.driverName}`
+                  : `Passenger: ${request.passengerName}`}{" "}
+                - {formatShortDate(request.requestedAt)}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+      {selectedRequest ? (
+        <InlineNotice
+          message={
+            reportedUserId
+              ? "This report will be linked to the selected request and associated user."
+              : "This report will be linked to the selected request. The related user is not available yet."
+          }
+          tone={reportedUserId ? "success" : "warning"}
+        />
+      ) : null}
       <TextInput
         value={description}
         onChangeText={setDescription}
@@ -1289,6 +1634,14 @@ export function PassengerHomeScreen() {
     request.requestStatusId === STATUS.REQUEST_PENDING ||
     request.requestStatusId === STATUS.REQUEST_ACCEPTED
   );
+  useRealtimeRefresh(
+    [
+      "drivers:available",
+      profile?.id ? `user:${profile.id}` : null,
+      activeRequest ? `request:${activeRequest.id}` : null,
+    ],
+    resource.refresh
+  );
 
   return (
     <ScreenShell
@@ -1308,8 +1661,18 @@ export function PassengerHomeScreen() {
             place={currentLocation.place}
           />
           <View className="flex-row gap-3">
-            <StatCard icon={Car} label="Nearby drivers" value={`${data.availableDrivers.length}`} />
-            <StatCard icon={ClipboardList} label="Requests" value={`${data.requests.length}`} />
+            <StatCard
+              icon={Car}
+              label="Nearby drivers"
+              tone="success"
+              value={`${data.availableDrivers.length}`}
+            />
+            <StatCard
+              icon={ClipboardList}
+              label="Requests"
+              tone="info"
+              value={`${data.requests.length}`}
+            />
           </View>
           <RouteMap
             drivers={data.availableDrivers}
@@ -1323,6 +1686,7 @@ export function PassengerHomeScreen() {
             }
             pickupName={currentLocation.place?.name ?? "Current location"}
           />
+          <MapLegend />
           {activeRequest ? (
             <RequestCard request={activeRequest} />
           ) : (
@@ -1357,8 +1721,10 @@ export function PassengerSearchScreen() {
   const [drivers, setDrivers] = useState<DriverSummary[]>([]);
   const [isMatching, setIsMatching] = useState(false);
   const [matchError, setMatchError] = useState<string | null>(null);
+  const [routeMetrics, setRouteMetrics] = useState<RouteMetrics | null>(null);
   const [selectedDriverId, setSelectedDriverId] = useState<string | null>(null);
   const [selectedDriver, setSelectedDriver] = useState<DriverSummary | null>(null);
+  useRealtimeRefresh(["drivers:available"], resource.refresh);
 
   useEffect(() => {
     let cancelled = false;
@@ -1366,6 +1732,7 @@ export function PassengerSearchScreen() {
     async function loadMatches() {
       if (!pickupPlace || !destinationPlace) {
         setDrivers([]);
+        setRouteMetrics(null);
         setMatchError(null);
         return;
       }
@@ -1374,6 +1741,10 @@ export function PassengerSearchScreen() {
       setMatchError(null);
 
       try {
+        const metrics = await computeRouteMetrics({
+          origin: toRoutePoint(pickupPlace),
+          destination: toRoutePoint(destinationPlace),
+        });
         const matchedDrivers = await listRouteMatchedDrivers({
           pickup: toRoutePoint(pickupPlace),
           destination: toRoutePoint(destinationPlace),
@@ -1381,6 +1752,7 @@ export function PassengerSearchScreen() {
         });
 
         if (!cancelled) {
+          setRouteMetrics(metrics);
           setDrivers(matchedDrivers);
         }
       } catch (error) {
@@ -1426,6 +1798,11 @@ export function PassengerSearchScreen() {
       return;
     }
 
+    if (driver.availabilityStatusId === STATUS.AVAILABILITY_BUSY) {
+      Alert.alert("Driver busy", "This driver is nearby but currently handling another trip.");
+      return;
+    }
+
     setSelectedDriverId(driver.id);
 
     try {
@@ -1434,7 +1811,11 @@ export function PassengerSearchScreen() {
         driverProfileId: driver.id,
         pickup: toRoutePoint(pickupPlace),
         destination: toRoutePoint(destinationPlace),
-        passengerNote: "Route-aware request from passenger search.",
+        passengerNote: routeMetrics
+          ? `Route-aware request. Estimated trip: ${formatDistanceMeters(
+              routeMetrics.distanceMeters
+            )}, ${formatDurationSeconds(routeMetrics.durationSeconds)}.`
+          : "Route-aware request from passenger search.",
       });
       await resource.refresh();
       Alert.alert("Request sent", `${driver.name} can now accept or reject your request.`);
@@ -1457,21 +1838,33 @@ export function PassengerSearchScreen() {
         <View className="mt-4 gap-4">
           <PlaceInput
             label="Pickup"
+            onChangeText={(value) => {
+              setPickup(value);
+              setPickupPlace(null);
+              setDrivers([]);
+            }}
             onSelect={(place, typedValue) => {
               setPickupPlace(place);
               setPickup(typedValue);
             }}
             onUseCurrentLocation={useCurrentPickup}
             placeholder="Pickup location"
+            selected={Boolean(pickupPlace)}
             value={pickup}
           />
           <PlaceInput
             label="Destination"
+            onChangeText={(value) => {
+              setDestination(value);
+              setDestinationPlace(null);
+              setDrivers([]);
+            }}
             onSelect={(place, typedValue) => {
               setDestinationPlace(place);
               setDestination(typedValue);
             }}
             placeholder="Where are you going?"
+            selected={Boolean(destinationPlace)}
             value={destination}
           />
         </View>
@@ -1491,22 +1884,19 @@ export function PassengerSearchScreen() {
         }
         destinationName={destinationPlace?.name ?? (destination || "Destination")}
         drivers={drivers}
-        pickup={
-          pickupPlace
-            ? {
-                latitude: pickupPlace.latitude,
-                longitude: pickupPlace.longitude,
-              }
-            : null
-        }
+        pickup={toCoordinate(pickupPlace)}
         pickupName={pickupPlace?.name ?? (pickup || "Pickup")}
+        routeCoordinates={routeMetrics?.coordinates ?? []}
       />
+      <MapLegend />
+      <RouteMetricsCard metrics={routeMetrics} />
       {resource.isLoading ? <LoadingState /> : null}
       {resource.error ? <ErrorState message={resource.error} onRetry={resource.refresh} /> : null}
       {isMatching ? <LoadingState /> : null}
       {matchError ? <ErrorState message={matchError} onRetry={resource.refresh} /> : null}
       {selectedDriver ? (
         <DriverDetailPanel
+          canRequest={selectedDriver.availabilityStatusId === STATUS.AVAILABILITY_ONLINE}
           driver={selectedDriver}
           requesting={selectedDriverId === selectedDriver.id}
           onClose={() => setSelectedDriver(null)}
@@ -1521,6 +1911,7 @@ export function PassengerSearchScreen() {
               key={driver.id}
               driver={driver}
               onViewDetails={() => setSelectedDriver(driver)}
+              canRequest={driver.availabilityStatusId === STATUS.AVAILABILITY_ONLINE}
               requesting={selectedDriverId === driver.id}
               onRequest={() => handleSendRequest(driver)}
             />
@@ -1563,6 +1954,18 @@ export function PassengerRequestsScreen() {
   }
 
   const requests = resource.data?.requests ?? [];
+  useRealtimeRefresh(
+    [
+      profile?.id ? `user:${profile.id}` : null,
+      ...requests
+        .filter((request) =>
+          request.requestStatusId === STATUS.REQUEST_PENDING ||
+          request.requestStatusId === STATUS.REQUEST_ACCEPTED
+        )
+        .map((request) => `request:${request.id}`),
+    ],
+    resource.refresh
+  );
 
   return (
     <ScreenShell
@@ -1622,6 +2025,13 @@ function UserReportsScreen({ role }: { role: "Passenger" | "Driver" }) {
   const refresh = role === "Driver" ? driverResource.refresh : resource.refresh;
   const refreshing =
     role === "Driver" ? driverResource.isRefreshing : resource.isRefreshing;
+  useRealtimeRefresh(
+    [
+      profile?.id ? `user:${profile.id}` : null,
+      ...reports.map((report) => `report:${report.id}`),
+    ],
+    refresh
+  );
 
   return (
     <ScreenShell
@@ -1630,7 +2040,14 @@ function UserReportsScreen({ role }: { role: "Passenger" | "Driver" }) {
       isRefreshing={refreshing}
       onRefresh={refresh}
     >
-      {profile?.id ? <ReportComposer reporterId={profile.id} onSubmitted={refresh} /> : null}
+      {profile?.id ? (
+        <ReportComposer
+          reporterId={profile.id}
+          requests={role === "Driver" ? driverResource.data?.requests ?? [] : resource.data?.requests ?? []}
+          role={role}
+          onSubmitted={refresh}
+        />
+      ) : null}
       {loading ? <LoadingState /> : null}
       {error ? <ErrorState message={error} onRetry={refresh} /> : null}
       {reports.length > 0 ? (
@@ -1662,6 +2079,14 @@ export function DriverHomeScreen() {
   const acceptedRequest = resource.data?.requests.find(
     (request) => request.requestStatusId === STATUS.REQUEST_ACCEPTED
   );
+  useRealtimeRefresh(
+    [
+      profile?.id ? `user:${profile.id}` : null,
+      driver ? `driver:${driver.id}` : null,
+      acceptedRequest ? `request:${acceptedRequest.id}` : null,
+    ],
+    resource.refresh
+  );
 
   async function handleAvailability(statusId: number) {
     if (!driver) {
@@ -1671,7 +2096,7 @@ export function DriverHomeScreen() {
     if (!canOperate) {
       Alert.alert(
         "Verification pending",
-        "Admin approval is required before you can go online or receive requests."
+        "Admin approval is required before you can go online, mark busy, or receive requests."
       );
       return;
     }
@@ -1682,7 +2107,10 @@ export function DriverHomeScreen() {
       let latitude: number | undefined;
       let longitude: number | undefined;
 
-      if (statusId === STATUS.AVAILABILITY_ONLINE) {
+      if (
+        statusId === STATUS.AVAILABILITY_ONLINE ||
+        statusId === STATUS.AVAILABILITY_BUSY
+      ) {
         const result = await getCurrentDevicePlace({ requestPermission: true });
 
         if (result.status !== "granted") {
@@ -1736,10 +2164,22 @@ export function DriverHomeScreen() {
       {driver ? (
         <>
           <View className="flex-row gap-3">
-            <StatCard icon={ClipboardList} label="Requests" value={`${pendingRequests.length}`} />
+            <StatCard
+              icon={ClipboardList}
+              label="Requests"
+              tone="violet"
+              value={`${pendingRequests.length}`}
+            />
             <StatCard
               icon={RadioTower}
               label="Availability"
+              tone={
+                driver.availabilityStatusId === STATUS.AVAILABILITY_BUSY
+                  ? "warning"
+                  : driver.availabilityStatusId === STATUS.AVAILABILITY_ONLINE
+                    ? "success"
+                    : "info"
+              }
               value={getAvailabilityStatus(driver.availabilityStatusId).label}
             />
           </View>
@@ -1756,23 +2196,35 @@ export function DriverHomeScreen() {
             }
             pickupName="Your shared location"
           />
+          <MapLegend />
           <View className="rounded-2xl border border-divider bg-surface p-4">
             <SectionTitle title="Availability" />
             <View className="mt-4 flex-row gap-3">
               <PrimaryButton
                 disabled={!canOperate}
-                label="Go online"
+                label="Online"
                 loading={isUpdating}
                 onPress={() => handleAvailability(STATUS.AVAILABILITY_ONLINE)}
               />
               <PrimaryButton
                 disabled={!canOperate}
-                label="Go offline"
+                label="Busy"
+                loading={isUpdating}
+                onPress={() => handleAvailability(STATUS.AVAILABILITY_BUSY)}
+                tone="warning"
+              />
+              <PrimaryButton
+                disabled={!canOperate}
+                label="Offline"
                 loading={isUpdating}
                 onPress={() => handleAvailability(STATUS.AVAILABILITY_OFFLINE)}
                 tone="outline"
               />
             </View>
+            <Text className="mt-3 font-jakarta text-xs text-textSecondary">
+              Busy keeps your last shared location visible to passengers, but they cannot send a
+              request until you are online again.
+            </Text>
           </View>
         </>
       ) : null}
@@ -1792,7 +2244,10 @@ export function DriverRouteScreen() {
   const [destinationName, setDestinationName] = useState("");
   const [startPlace, setStartPlace] = useState<PlaceSelection | null>(null);
   const [destinationPlace, setDestinationPlace] = useState<PlaceSelection | null>(null);
+  const [routeMetrics, setRouteMetrics] = useState<RouteMetrics | null>(null);
+  const [routeError, setRouteError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  useRealtimeRefresh([driver ? `driver:${driver.id}` : null], resource.refresh);
 
   useEffect(() => {
     if (driver?.activeRoute) {
@@ -1813,8 +2268,52 @@ export function DriverRouteScreen() {
       setDestinationName(activeDestination.name);
       setStartPlace(activeStart);
       setDestinationPlace(activeDestination);
+      setRouteMetrics(
+        driver.activeRoute.route_polyline
+          ? {
+              coordinates: routeCoordinatesFromPolyline(driver.activeRoute.route_polyline),
+              distanceMeters: 0,
+              durationSeconds: 0,
+              encodedPolyline: driver.activeRoute.route_polyline,
+            }
+          : null
+      );
     }
   }, [driver?.activeRoute]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadRoutePreview() {
+      if (!startPlace || !destinationPlace) {
+        setRouteMetrics(null);
+        setRouteError(null);
+        return;
+      }
+
+      try {
+        setRouteError(null);
+        const metrics = await computeRouteMetrics({
+          origin: toRoutePoint(startPlace),
+          destination: toRoutePoint(destinationPlace),
+        });
+
+        if (!cancelled) {
+          setRouteMetrics(metrics);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setRouteMetrics(null);
+          setRouteError(friendlyAppError(error));
+        }
+      }
+    }
+
+    loadRoutePreview();
+    return () => {
+      cancelled = true;
+    };
+  }, [destinationPlace, startPlace]);
 
   async function useCurrentRouteStart() {
     const result = await getCurrentDevicePlace({ requestPermission: true });
@@ -1853,6 +2352,7 @@ export function DriverRouteScreen() {
         driverProfileId: driver.id,
         start: toRoutePoint(startPlace),
         destination: toRoutePoint(destinationPlace),
+        routePolyline: routeMetrics?.encodedPolyline ?? null,
       });
       await resource.refresh();
       Alert.alert("Route active", "Passengers can now match with this route.");
@@ -1878,23 +2378,41 @@ export function DriverRouteScreen() {
         <View className="mt-4 gap-4">
           <PlaceInput
             label="Start location"
+            onChangeText={(value) => {
+              setStartName(value);
+              setStartPlace(null);
+            }}
             onSelect={(place, typedValue) => {
               setStartPlace(place);
               setStartName(typedValue);
             }}
             onUseCurrentLocation={useCurrentRouteStart}
             placeholder="Where will you start?"
+            selected={Boolean(startPlace)}
             value={startName}
           />
           <PlaceInput
             label="Destination"
+            onChangeText={(value) => {
+              setDestinationName(value);
+              setDestinationPlace(null);
+            }}
             onSelect={(place, typedValue) => {
               setDestinationPlace(place);
               setDestinationName(typedValue);
             }}
             placeholder="Where are you heading?"
+            selected={Boolean(destinationPlace)}
             value={destinationName}
           />
+        </View>
+        {routeError ? (
+          <View className="mt-4">
+            <InlineNotice message={routeError} tone="warning" />
+          </View>
+        ) : null}
+        <View className="mt-4">
+          <RouteMetricsCard metrics={routeMetrics} />
         </View>
         <View className="mt-4 flex-row">
           <PrimaryButton
@@ -1916,16 +2434,11 @@ export function DriverRouteScreen() {
         }
         destinationName={destinationPlace?.name ?? (destinationName || "Destination")}
         drivers={driver ? [driver] : []}
-        pickup={
-          startPlace
-            ? {
-                latitude: startPlace.latitude,
-                longitude: startPlace.longitude,
-              }
-            : null
-        }
+        pickup={toCoordinate(startPlace)}
         pickupName={startPlace?.name ?? (startName || "Start")}
+        routeCoordinates={routeMetrics?.coordinates ?? []}
       />
+      <MapLegend />
       {driver?.activeRoute ? (
         <View className="rounded-2xl border border-divider bg-surface p-4">
           <SectionTitle title="Active route" />
@@ -1956,6 +2469,20 @@ export function DriverRequestsScreen() {
   const driver = resource.data?.driver ?? null;
   const canRespond = driver?.verificationStatusId === STATUS.VERIFICATION_APPROVED;
   const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const requests = resource.data?.requests ?? [];
+  useRealtimeRefresh(
+    [
+      profile?.id ? `user:${profile.id}` : null,
+      driver ? `driver:${driver.id}` : null,
+      ...requests
+        .filter((request) =>
+          request.requestStatusId === STATUS.REQUEST_PENDING ||
+          request.requestStatusId === STATUS.REQUEST_ACCEPTED
+        )
+        .map((request) => `request:${request.id}`),
+    ],
+    resource.refresh
+  );
 
   async function shareRequestLocation(requestId: string) {
     if (!driver) {
@@ -2015,8 +2542,6 @@ export function DriverRequestsScreen() {
     }
   }
 
-  const requests = resource.data?.requests ?? [];
-
   return (
     <ScreenShell
       title="Requests"
@@ -2069,6 +2594,7 @@ export function DriverReportsScreen() {
 export function AdminDashboardScreen() {
   const resource = useAsyncResource(getAdminDashboard, []);
   const data = resource.data;
+  useRealtimeRefresh(["admin:drivers", "admin:reports"], resource.refresh);
 
   return (
     <ScreenShell
@@ -2082,12 +2608,27 @@ export function AdminDashboardScreen() {
       {data ? (
         <>
           <View className="flex-row gap-3">
-            <StatCard icon={Users} label="Users" value={`${data.totalUsers}`} />
-            <StatCard icon={Car} label="Active drivers" value={`${data.activeDrivers}`} />
+            <StatCard icon={Users} label="Users" tone="info" value={`${data.totalUsers}`} />
+            <StatCard
+              icon={Car}
+              label="Active drivers"
+              tone="success"
+              value={`${data.activeDrivers}`}
+            />
           </View>
           <View className="flex-row gap-3">
-            <StatCard icon={Clock3} label="Pending drivers" value={`${data.pendingDrivers}`} />
-            <StatCard icon={AlertTriangle} label="Pending reports" value={`${data.pendingReports}`} />
+            <StatCard
+              icon={Clock3}
+              label="Pending drivers"
+              tone="warning"
+              value={`${data.pendingDrivers}`}
+            />
+            <StatCard
+              icon={AlertTriangle}
+              label="Pending reports"
+              tone="danger"
+              value={`${data.pendingReports}`}
+            />
           </View>
           <SectionTitle title="Recent reports" />
           {data.reports.slice(0, 3).map((report) => (
@@ -2107,6 +2648,7 @@ export function AdminUsersScreen() {
   const [roleFilter, setRoleFilter] = useState<"all" | "passengers" | "drivers" | "admins">("all");
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
+  useRealtimeRefresh(["admin:drivers"], resource.refresh);
 
   const filteredUsers = users.filter((user) => {
     const matchesQuery =
@@ -2285,6 +2827,7 @@ export function AdminDriversScreen() {
   const resource = useAsyncResource(getAdminDashboard, []);
   const drivers = resource.data?.drivers ?? [];
   const [updatingId, setUpdatingId] = useState<string | null>(null);
+  useRealtimeRefresh(["admin:drivers"], resource.refresh);
 
   async function updateVerification(driverId: string, statusId: number) {
     setUpdatingId(driverId);
@@ -2363,16 +2906,32 @@ export function AdminReportsScreen() {
   const resource = useAsyncResource(getAdminDashboard, []);
   const reports = resource.data?.reports ?? [];
   const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const [resolutionNote, setResolutionNote] = useState("");
+  useRealtimeRefresh(
+    ["admin:reports", ...reports.map((report) => `report:${report.id}`)],
+    resource.refresh
+  );
 
   async function handleReport(reportId: string, statusId: number) {
     if (!profile?.id) {
       return;
     }
 
+    const cleanNote = resolutionNote.trim();
+
+    if (cleanNote.length < 8) {
+      Alert.alert(
+        "Resolution note needed",
+        "Add a short admin note before resolving or dismissing this report."
+      );
+      return;
+    }
+
     setUpdatingId(reportId);
 
     try {
-      await updateReportStatus(reportId, statusId, profile.id);
+      await updateReportStatus(reportId, statusId, profile.id, cleanNote);
+      setResolutionNote("");
       await resource.refresh();
     } catch (error) {
       Alert.alert("Report update failed", error instanceof Error ? error.message : "Try again.");
@@ -2390,6 +2949,21 @@ export function AdminReportsScreen() {
     >
       {resource.isLoading ? <LoadingState /> : null}
       {resource.error ? <ErrorState message={resource.error} onRetry={resource.refresh} /> : null}
+      <View className="rounded-2xl border border-divider bg-surface p-4">
+        <Text className="font-jakarta-bold text-base text-text">Resolution note</Text>
+        <Text className="mt-1 font-jakarta text-sm text-textSecondary">
+          This note is saved to the report and shown when the case is resolved or dismissed.
+        </Text>
+        <TextInput
+          value={resolutionNote}
+          onChangeText={setResolutionNote}
+          multiline
+          placeholder="Example: Driver contacted and warning issued."
+          placeholderTextColor={colors.textSecondary}
+          className="mt-3 min-h-[86px] rounded-xl border border-divider bg-background px-4 py-3 font-jakarta text-text"
+          textAlignVertical="top"
+        />
+      </View>
       {reports.length > 0 ? (
         reports.map((report) => (
           <View key={report.id} className={updatingId === report.id ? "opacity-60" : ""}>
@@ -2411,6 +2985,165 @@ export function AdminReportsScreen() {
   );
 }
 
+type ProfileSectionKey = "about" | "help" | "permissions" | "privacy" | "terms";
+
+type ProfileSectionConfig = {
+  key: ProfileSectionKey;
+  title: string;
+  subtitle: string;
+  icon: LucideIcon;
+  color: string;
+  bg: string;
+};
+
+const PROFILE_SECTIONS: ProfileSectionConfig[] = [
+  {
+    key: "help",
+    title: "Help center",
+    subtitle: "Support topics for requests, routes, reports, and account issues.",
+    icon: HelpCircle,
+    color: colors.info,
+    bg: colors.infoSoft,
+  },
+  {
+    key: "privacy",
+    title: "Privacy & security",
+    subtitle: "Location sharing, account access, and safety controls.",
+    icon: LockKeyhole,
+    color: colors.violet,
+    bg: colors.violetSoft,
+  },
+  {
+    key: "terms",
+    title: "Terms",
+    subtitle: "Platform responsibilities for passengers, drivers, and admins.",
+    icon: ScrollText,
+    color: colors.primary,
+    bg: colors.primarySoft,
+  },
+  {
+    key: "permissions",
+    title: "Permissions",
+    subtitle: "Location and notifications needed for live transport tracking.",
+    icon: SlidersHorizontal,
+    color: colors.warning,
+    bg: colors.warningSoft,
+  },
+  {
+    key: "about",
+    title: "About TransTrak",
+    subtitle: "Academic prototype for local transport visibility in Cameroon.",
+    icon: Info,
+    color: colors.success,
+    bg: colors.successSoft,
+  },
+];
+
+function ProfileSettingsItem({
+  item,
+  onPress,
+}: {
+  item: ProfileSectionConfig;
+  onPress: () => void;
+}) {
+  const Icon = item.icon;
+
+  return (
+    <TouchableOpacity
+      activeOpacity={0.8}
+      onPress={onPress}
+      className="flex-row items-center rounded-2xl border border-divider bg-background p-3"
+    >
+      <View
+        className="mr-3 h-10 w-10 items-center justify-center rounded-full"
+        style={{ backgroundColor: item.bg }}
+      >
+        <Icon color={item.color} size={19} />
+      </View>
+      <View className="flex-1">
+        <Text className="font-jakarta-bold text-sm text-text">{item.title}</Text>
+        <Text className="mt-0.5 font-jakarta text-xs text-textSecondary">{item.subtitle}</Text>
+      </View>
+      <ChevronRight color={colors.textSecondary} size={18} />
+    </TouchableOpacity>
+  );
+}
+
+function ProfileSectionPanel({
+  onClose,
+  role,
+  section,
+}: {
+  onClose: () => void;
+  role: string;
+  section: ProfileSectionConfig;
+}) {
+  const content: Record<ProfileSectionKey, string[]> = {
+    about: [
+      "TransTrak supports route-aware matching between passengers and nearby local transport.",
+      "The prototype focuses on Cameroon transport patterns, driver verification, reports, and live location visibility.",
+      `Current account role: ${role}.`,
+    ],
+    help: [
+      "Passengers can map pickup and destination, choose a route-matched driver, then track an accepted trip.",
+      "Drivers should keep availability accurate, share an active route, and respond quickly to requests.",
+      "Reports should include the linked trip when the issue concerns a specific transport request.",
+    ],
+    permissions: [
+      "Location access is needed to show nearby drivers, compute pickup distance, and update live trip progress.",
+      "Notification permission is useful for new requests, accepted trips, verification updates, and report decisions.",
+      "If location is not shared, the app shows a polite message instead of static or misleading map data.",
+    ],
+    privacy: [
+      "Your live location is used for transport discovery, matching, and active trip tracking.",
+      "Driver verification details are reviewed by administrators and should only be used for platform safety.",
+      "Use logout on shared devices and report suspicious activity from the reports screen.",
+    ],
+    terms: [
+      "Passengers should send requests only for real pickup and destination plans.",
+      "Drivers should not accept requests while unavailable, unsafe, or already handling another passenger.",
+      "Administrators should resolve reports with clear notes and fair moderation decisions.",
+    ],
+  };
+
+  const Icon = section.icon;
+
+  return (
+    <View className="rounded-2xl border border-divider bg-surface p-4">
+      <View className="flex-row items-start justify-between">
+        <View className="flex-row flex-1 items-center pr-3">
+          <View
+            className="mr-3 h-11 w-11 items-center justify-center rounded-full"
+            style={{ backgroundColor: section.bg }}
+          >
+            <Icon color={section.color} size={21} />
+          </View>
+          <View className="flex-1">
+            <Text className="font-jakarta-bold text-base text-text">{section.title}</Text>
+            <Text className="mt-0.5 font-jakarta text-xs text-textSecondary">
+              {section.subtitle}
+            </Text>
+          </View>
+        </View>
+        <TouchableOpacity
+          activeOpacity={0.75}
+          onPress={onClose}
+          className="h-9 w-9 items-center justify-center rounded-full bg-background"
+        >
+          <X color={colors.textSecondary} size={17} />
+        </TouchableOpacity>
+      </View>
+      <View className="mt-4 gap-3">
+        {content[section.key].map((line) => (
+          <View key={line} className="rounded-xl bg-background p-3">
+            <Text className="font-jakarta text-sm text-text">{line}</Text>
+          </View>
+        ))}
+      </View>
+    </View>
+  );
+}
+
 export function ProfileScreen() {
   const { profile, logout, isLoading, refreshProfile } = useAuth();
   const driverResource = useAsyncResource(
@@ -2422,6 +3155,7 @@ export function ProfileScreen() {
   );
   const driver = driverResource.data?.driver ?? null;
   const verification = driverResource.data?.verification ?? null;
+  const refreshDriverDashboard = driverResource.refresh;
   const role =
     profile?.role_id === STATUS.ROLE_ADMIN
       ? "Administrator"
@@ -2436,6 +3170,21 @@ export function ProfileScreen() {
   const [vehicleTypeId, setVehicleTypeId] = useState<1000 | 2000>(1000);
   const [plateNumber, setPlateNumber] = useState("");
   const [bikeColour, setBikeColour] = useState("Blue");
+  const [activeSectionKey, setActiveSectionKey] = useState<ProfileSectionKey | null>(null);
+  const activeSection =
+    PROFILE_SECTIONS.find((section) => section.key === activeSectionKey) ?? null;
+  const refreshProfileScreen = useCallback(async () => {
+    await refreshProfile();
+    await refreshDriverDashboard();
+  }, [refreshDriverDashboard, refreshProfile]);
+
+  useRealtimeRefresh(
+    [
+      profile?.id ? `user:${profile.id}` : null,
+      driver ? `driver:${driver.id}` : null,
+    ],
+    refreshProfileScreen
+  );
 
   useEffect(() => {
     setFullName(profile?.full_name ?? "");
@@ -2537,6 +3286,46 @@ export function ProfileScreen() {
           driver={driver}
           verification={verification}
           onSubmitted={driverResource.refresh}
+        />
+      ) : null}
+
+      <View className="rounded-2xl border border-divider bg-surface p-4">
+        <SectionTitle title="Account center" />
+        <View className="mt-4 gap-3">
+          <TouchableOpacity
+            activeOpacity={0.8}
+            onPress={() => {
+              setActiveSectionKey(null);
+              setEditing(true);
+            }}
+            className="flex-row items-center rounded-2xl border border-divider bg-background p-3"
+          >
+            <View className="mr-3 h-10 w-10 items-center justify-center rounded-full bg-primarySoft">
+              <Edit3 color={colors.primary} size={19} />
+            </View>
+            <View className="flex-1">
+              <Text className="font-jakarta-bold text-sm text-text">Edit profile</Text>
+              <Text className="mt-0.5 font-jakarta text-xs text-textSecondary">
+                Update name, phone, city, and driver vehicle details.
+              </Text>
+            </View>
+            <ChevronRight color={colors.textSecondary} size={18} />
+          </TouchableOpacity>
+          {PROFILE_SECTIONS.map((section) => (
+            <ProfileSettingsItem
+              key={section.key}
+              item={section}
+              onPress={() => setActiveSectionKey(section.key)}
+            />
+          ))}
+        </View>
+      </View>
+
+      {activeSection ? (
+        <ProfileSectionPanel
+          role={role}
+          section={activeSection}
+          onClose={() => setActiveSectionKey(null)}
         />
       ) : null}
 

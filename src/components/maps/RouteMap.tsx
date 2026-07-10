@@ -1,9 +1,10 @@
 import { Text, View } from "react-native";
+import { Bike, Car } from "lucide-react-native";
 import MapView, { Marker, Polyline } from "react-native-maps";
 import type { Region } from "react-native-maps";
 
 import { colors } from "../../constants/colors";
-import type { DriverSummary } from "../../services/app/appService";
+import { STATUS, type DriverSummary } from "../../services/app/appService";
 
 type Coordinate = {
   latitude: number;
@@ -16,7 +17,47 @@ type RouteMapProps = {
   destinationName?: string;
   pickup?: Coordinate | null;
   pickupName?: string;
+  routeCoordinates?: Coordinate[];
 };
+
+function DriverMarkerIcon({ driver }: { driver: DriverSummary }) {
+  const isBike = driver.vehicleTypeId === 2000;
+  const isBusy = driver.availabilityStatusId === STATUS.AVAILABILITY_BUSY;
+  const Icon = isBike ? Bike : Car;
+  const backgroundColor = isBusy ? colors.warning : isBike ? colors.bike : colors.taxi;
+  const iconColor = isBike || isBusy ? "#FFFFFF" : colors.text;
+
+  return (
+    <View className="items-center">
+      <View
+        className="h-9 w-9 items-center justify-center rounded-full border-2 border-white"
+        style={{
+          backgroundColor,
+          shadowColor: colors.text,
+          shadowOffset: { width: 0, height: 2 },
+          shadowOpacity: 0.25,
+          shadowRadius: 4,
+          elevation: 4,
+        }}
+      >
+        <Icon color={iconColor} size={19} strokeWidth={2.6} />
+      </View>
+      <View
+        style={{
+          borderLeftColor: "transparent",
+          borderLeftWidth: 6,
+          borderRightColor: "transparent",
+          borderRightWidth: 6,
+          borderTopColor: backgroundColor,
+          borderTopWidth: 8,
+          height: 0,
+          marginTop: -1,
+          width: 0,
+        }}
+      />
+    </View>
+  );
+}
 
 export function RouteMap({
   destination,
@@ -24,6 +65,7 @@ export function RouteMap({
   destinationName = "Destination",
   pickup,
   pickupName = "Pickup",
+  routeCoordinates = [],
 }: RouteMapProps) {
   const driverMarkers = drivers.filter(
     (driver) =>
@@ -62,7 +104,7 @@ export function RouteMap({
     longitudeDelta: 0.035,
   };
 
-  const route = [pickup, destination].filter(
+  const route = routeCoordinates.length > 1 ? routeCoordinates : [pickup, destination].filter(
     (coordinate): coordinate is Coordinate => Boolean(coordinate)
   );
 
@@ -81,15 +123,19 @@ export function RouteMap({
         ) : null}
         {driverMarkers.slice(0, 8).map((driver) => (
           <Marker
+            anchor={{ x: 0.5, y: 1 }}
             key={driver.id}
             coordinate={{
               latitude: driver.currentLatitude as number,
               longitude: driver.currentLongitude as number,
             }}
-            pinColor={driver.vehicleTypeId === 2000 ? colors.warning : colors.accent}
             title={driver.name}
-            description={driver.vehicleLabel}
-          />
+            description={`${driver.vehicleLabel} - ${
+              driver.availabilityStatusId === STATUS.AVAILABILITY_BUSY ? "Busy" : "Available"
+            }`}
+          >
+            <DriverMarkerIcon driver={driver} />
+          </Marker>
         ))}
         {route.length > 1 ? (
           <Polyline coordinates={route} strokeColor={colors.primary} strokeWidth={4} />

@@ -71,6 +71,7 @@ type DriverRouteRow = {
   start_longitude: number;
   destination_latitude: number;
   destination_longitude: number;
+  route_polyline: string | null;
   route_status_id: number;
   started_at: string;
   ended_at: string | null;
@@ -152,6 +153,7 @@ export type TransportRequestSummary = {
   passengerName: string;
   driverName: string;
   vehicleLabel: string;
+  vehicleTypeId: number | null;
   plateNumber: string | null;
   pickupName: string;
   destinationName: string;
@@ -164,6 +166,7 @@ export type TransportRequestSummary = {
   requestedAt: string;
   driverCurrentLatitude: number | null;
   driverCurrentLongitude: number | null;
+  driverProfileUserId: string | null;
 };
 
 export type ReportSummary = {
@@ -174,6 +177,9 @@ export type ReportSummary = {
   reportStatusId: number;
   reporterName: string;
   reportedUserName: string | null;
+  transportRequestId: string | null;
+  resolutionNote: string | null;
+  resolvedAt: string | null;
   createdAt: string;
 };
 
@@ -350,7 +356,9 @@ async function enrichDrivers(rows: DriverProfileRow[]) {
 }
 
 export async function listDrivers(options?: {
+  availabilityStatusIds?: number[];
   approvedOnly?: boolean;
+  driverProfileIds?: string[];
   onlineOnly?: boolean;
   withLocationOnly?: boolean;
   limit?: number;
@@ -365,8 +373,16 @@ export async function listDrivers(options?: {
     query = query.eq("verification_status_id", STATUS.VERIFICATION_APPROVED);
   }
 
+  if (options?.driverProfileIds?.length) {
+    query = query.in("id", options.driverProfileIds);
+  }
+
   if (options?.onlineOnly) {
     query = query.eq("availability_status_id", STATUS.AVAILABILITY_ONLINE);
+  }
+
+  if (options?.availabilityStatusIds?.length) {
+    query = query.in("availability_status_id", options.availabilityStatusIds);
   }
 
   if (options?.withLocationOnly) {
@@ -435,8 +451,8 @@ export async function listRouteMatchedDrivers(input: {
   pickup: RoutePointInput;
 }) {
   const drivers = await listDrivers({
+    availabilityStatusIds: [STATUS.AVAILABILITY_ONLINE, STATUS.AVAILABILITY_BUSY],
     approvedOnly: true,
-    onlineOnly: true,
     withLocationOnly: true,
     limit: 100,
   });
@@ -532,6 +548,7 @@ async function enrichRequests(rows: TransportRequestRow[]) {
       passengerName: passenger?.full_name ?? "Passenger",
       driverName: driver?.name ?? "Matching driver",
       vehicleLabel: driver?.vehicleLabel ?? "Vehicle pending",
+      vehicleTypeId: driver?.vehicleTypeId ?? null,
       plateNumber: driver?.plateNumber ?? null,
       pickupName: row.pickup_name ?? "Pickup point",
       destinationName: row.destination_name ?? "Destination",
@@ -544,6 +561,7 @@ async function enrichRequests(rows: TransportRequestRow[]) {
       requestedAt: row.requested_at,
       driverCurrentLatitude: driver?.currentLatitude ?? null,
       driverCurrentLongitude: driver?.currentLongitude ?? null,
+      driverProfileUserId: driver?.profileId ?? null,
     };
   });
 }
@@ -589,6 +607,9 @@ async function enrichReports(rows: ReportRow[]) {
     reportedUserName: row.reported_user_id
       ? profileMap.get(row.reported_user_id)?.full_name ?? "Reported user"
       : null,
+    transportRequestId: row.transport_request_id,
+    resolutionNote: row.resolution_note,
+    resolvedAt: row.resolved_at,
     createdAt: row.created_at,
   }));
 }
@@ -619,8 +640,8 @@ export async function listAdminReports() {
 export async function getPassengerDashboard(profileId: string): Promise<PassengerDashboardData> {
   const [availableDrivers, requests, reports] = await Promise.all([
     listDrivers({
+      availabilityStatusIds: [STATUS.AVAILABILITY_ONLINE, STATUS.AVAILABILITY_BUSY],
       approvedOnly: true,
-      onlineOnly: true,
       withLocationOnly: true,
       limit: 20,
     }),
@@ -691,6 +712,27 @@ export async function createTransportRequest(input: {
   passengerNote?: string;
   pickup: RoutePointInput;
 }) {
+  const [selectedDriver] = await listDrivers({
+    driverProfileIds: [input.driverProfileId],
+    limit: 1,
+  });
+
+  if (!selectedDriver) {
+    throw new Error("This driver is no longer available. Choose another nearby driver.");
+  }
+
+  if (selectedDriver.verificationStatusId !== STATUS.VERIFICATION_APPROVED) {
+    throw new Error("This driver is not approved for requests yet.");
+  }
+
+  if (selectedDriver.availabilityStatusId === STATUS.AVAILABILITY_BUSY) {
+    throw new Error("This driver is currently busy. Choose another nearby driver.");
+  }
+
+  if (selectedDriver.availabilityStatusId !== STATUS.AVAILABILITY_ONLINE) {
+    throw new Error("This driver is offline right now. Choose another nearby driver.");
+  }
+
   const { data, error } = await supabase
     .from("transport_requests")
     .insert({
@@ -710,16 +752,13 @@ export async function createTransportRequest(input: {
 
   formatError(error);
 
-  const [driver] = await listDrivers({ limit: 100 }).then((drivers) =>
-    drivers.filter((item) => item.id === input.driverProfileId)
-  );
-  const match = driver ? scoreRouteMatch(driver, input.pickup, input.destination) : null;
+  const match = selectedDriver ? scoreRouteMatch(selectedDriver, input.pickup, input.destination) : null;
 
-  if (driver) {
+  if (selectedDriver) {
     const { error: matchError } = await supabase.from("route_matches").insert({
       request_id: data.id,
       driver_profile_id: input.driverProfileId,
-      driver_route_id: driver.activeRoute?.id ?? null,
+      driver_route_id: selectedDriver.activeRoute?.id ?? null,
       distance_to_pickup_m:
         typeof match?.distanceToPickupKm === "number" ? match.distanceToPickupKm * 1000 : null,
       route_alignment_score: match?.routeAlignmentScore ?? null,
@@ -779,6 +818,31 @@ export async function updateTransportRequestStatus(
     .eq("id", requestId);
 
   formatError(error);
+
+  if (
+    statusId === STATUS.REQUEST_ACCEPTED ||
+    statusId === STATUS.REQUEST_COMPLETED ||
+    statusId === STATUS.REQUEST_CANCELLED ||
+    statusId === STATUS.REQUEST_REJECTED
+  ) {
+    const { data: requestDriver } = await supabase
+      .from("transport_requests")
+      .select("driver_profile_id")
+      .eq("id", requestId)
+      .maybeSingle();
+
+    if (requestDriver?.driver_profile_id) {
+      await supabase
+        .from("driver_profiles")
+        .update({
+          availability_status_id:
+            statusId === STATUS.REQUEST_ACCEPTED
+              ? STATUS.AVAILABILITY_BUSY
+              : STATUS.AVAILABILITY_ONLINE,
+        })
+        .eq("id", requestDriver.driver_profile_id);
+    }
+  }
 
   if (statusId === STATUS.REQUEST_ACCEPTED || statusId === STATUS.REQUEST_REJECTED) {
     const { data: request } = await supabase
@@ -936,6 +1000,7 @@ export async function updateUserAccountStatus(
 export async function saveDriverRoute(input: {
   destination: RoutePointInput;
   driverProfileId: string;
+  routePolyline?: string | null;
   start: RoutePointInput;
 }) {
   await supabase
@@ -957,6 +1022,7 @@ export async function saveDriverRoute(input: {
       start_longitude: input.start.longitude,
       destination_latitude: input.destination.latitude,
       destination_longitude: input.destination.longitude,
+      route_polyline: input.routePolyline ?? null,
       route_status_id: STATUS.ROUTE_ACTIVE,
     })
     .select("*")

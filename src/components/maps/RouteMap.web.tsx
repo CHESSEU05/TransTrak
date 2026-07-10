@@ -15,6 +15,7 @@ type RouteMapProps = {
   destinationName?: string;
   pickup?: Coordinate | null;
   pickupName?: string;
+  routeCoordinates?: Coordinate[];
 };
 
 export function RouteMap({
@@ -23,10 +24,12 @@ export function RouteMap({
   destinationName = "Destination",
   pickup,
   pickupName = "Pickup",
+  routeCoordinates = [],
 }: RouteMapProps) {
   const hasMapData =
     Boolean(pickup) ||
     Boolean(destination) ||
+    routeCoordinates.length > 1 ||
     drivers.some(
       (driver) =>
         typeof driver.currentLatitude === "number" &&
