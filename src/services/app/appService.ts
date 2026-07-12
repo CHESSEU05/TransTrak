@@ -1,4 +1,5 @@
 import type { Profile } from "../../types/auth";
+import { decodeRoutePolyline } from "../location/googlePlacesService";
 import { supabase } from "../supabase/client";
 
 export const STATUS = {
@@ -35,10 +36,18 @@ export const REPORT_TYPES = [
   { id: 4000, label: "Other concern" },
 ] as const;
 
+export const DRIVER_LOCATION_STALE_MINUTES = 20;
+export const DRIVER_VERIFICATION_STORAGE_BUCKET = "driver-verifications";
+
 export type RoutePointInput = {
   latitude: number;
   longitude: number;
   name: string;
+};
+
+export type RouteCoordinateInput = {
+  latitude: number;
+  longitude: number;
 };
 
 type DriverProfileRow = {
@@ -252,6 +261,60 @@ function formatError(error: { message: string } | null) {
   }
 }
 
+async function recordAdminAuditLog(input: {
+  action: string;
+  adminId?: string | null;
+  entityId: string;
+  entityTable: string;
+  metadata?: Record<string, unknown>;
+}) {
+  if (!input.adminId) {
+    return;
+  }
+
+  try {
+    const { error } = await supabase.from("admin_audit_logs").insert({
+      actor_id: input.adminId,
+      action: input.action,
+      entity_table: input.entityTable,
+      entity_id: input.entityId,
+      metadata: input.metadata ?? {},
+    });
+
+    if (error) {
+      console.warn("Admin audit log was not saved:", error.message);
+    }
+  } catch (error) {
+    console.warn(
+      "Admin audit log was not saved:",
+      error instanceof Error ? error.message : "Unknown error"
+    );
+  }
+}
+
+function isDriverVerificationStorageUrl(value: string) {
+  try {
+    const url = new URL(value);
+    const path = url.pathname.toLowerCase();
+
+    return (
+      path.includes("/storage/v1/object/") &&
+      path.includes(`/${DRIVER_VERIFICATION_STORAGE_BUCKET.toLowerCase()}/`)
+    );
+  } catch {
+    const normalized = value.toLowerCase();
+
+    return (
+      normalized.startsWith(`${DRIVER_VERIFICATION_STORAGE_BUCKET.toLowerCase()}/`) ||
+      normalized.startsWith(`supabase://${DRIVER_VERIFICATION_STORAGE_BUCKET.toLowerCase()}/`)
+    );
+  }
+}
+
+function normalizeReportText(value: string) {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
 function distanceKm(a: { latitude: number; longitude: number }, b: { latitude: number; longitude: number }) {
   const toRadians = (value: number) => (value * Math.PI) / 180;
   const radiusKm = 6371;
@@ -265,6 +328,145 @@ function distanceKm(a: { latitude: number; longitude: number }, b: { latitude: n
     Math.sin(dLon / 2) * Math.sin(dLon / 2) * Math.cos(lat1) * Math.cos(lat2);
 
   return radiusKm * 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
+}
+
+function routeLengthKm(route: RouteCoordinateInput[]) {
+  return route.reduce((total, point, index) => {
+    if (index === 0) {
+      return total;
+    }
+
+    return total + distanceKm(route[index - 1], point);
+  }, 0);
+}
+
+function toLocalKm(point: RouteCoordinateInput, origin: RouteCoordinateInput) {
+  const toRadians = (value: number) => (value * Math.PI) / 180;
+  const radiusKm = 6371;
+  const latitude = toRadians(point.latitude - origin.latitude) * radiusKm;
+  const longitude =
+    toRadians(point.longitude - origin.longitude) *
+    radiusKm *
+    Math.cos(toRadians((point.latitude + origin.latitude) / 2));
+
+  return { latitude, longitude };
+}
+
+function nearestRoutePosition(point: RouteCoordinateInput, route: RouteCoordinateInput[]) {
+  if (route.length === 0) {
+    return null;
+  }
+
+  if (route.length === 1) {
+    return {
+      distanceKm: distanceKm(point, route[0]),
+      progressKm: 0,
+    };
+  }
+
+  let travelledKm = 0;
+  let best: { distanceKm: number; progressKm: number } | null = null;
+
+  for (let index = 1; index < route.length; index += 1) {
+    const start = route[index - 1];
+    const end = route[index];
+    const segmentLengthKm = distanceKm(start, end);
+
+    if (segmentLengthKm === 0) {
+      continue;
+    }
+
+    const pointKm = toLocalKm(point, start);
+    const endKm = toLocalKm(end, start);
+    const segmentLengthSquared =
+      endKm.latitude * endKm.latitude + endKm.longitude * endKm.longitude;
+    const progressRatio =
+      segmentLengthSquared === 0
+        ? 0
+        : Math.max(
+            0,
+            Math.min(
+              1,
+              (pointKm.latitude * endKm.latitude + pointKm.longitude * endKm.longitude) /
+                segmentLengthSquared
+            )
+          );
+    const closest = {
+      latitude: start.latitude + (end.latitude - start.latitude) * progressRatio,
+      longitude: start.longitude + (end.longitude - start.longitude) * progressRatio,
+    };
+    const candidate = {
+      distanceKm: distanceKm(point, closest),
+      progressKm: travelledKm + segmentLengthKm * progressRatio,
+    };
+
+    if (!best || candidate.distanceKm < best.distanceKm) {
+      best = candidate;
+    }
+
+    travelledKm += segmentLengthKm;
+  }
+
+  return best;
+}
+
+function bearingDegrees(from: RouteCoordinateInput, to: RouteCoordinateInput) {
+  const toRadians = (value: number) => (value * Math.PI) / 180;
+  const toDegrees = (value: number) => (value * 180) / Math.PI;
+  const startLat = toRadians(from.latitude);
+  const endLat = toRadians(to.latitude);
+  const longitudeDelta = toRadians(to.longitude - from.longitude);
+  const y = Math.sin(longitudeDelta) * Math.cos(endLat);
+  const x =
+    Math.cos(startLat) * Math.sin(endLat) -
+    Math.sin(startLat) * Math.cos(endLat) * Math.cos(longitudeDelta);
+
+  return (toDegrees(Math.atan2(y, x)) + 360) % 360;
+}
+
+function bearingDifferenceDegrees(first: number, second: number) {
+  const difference = Math.abs(first - second) % 360;
+  return difference > 180 ? 360 - difference : difference;
+}
+
+function routeNearnessRatio(passengerRoute: RouteCoordinateInput[], driverRoute: RouteCoordinateInput[]) {
+  if (passengerRoute.length === 0 || driverRoute.length === 0) {
+    return 0;
+  }
+
+  const step = Math.max(1, Math.floor(passengerRoute.length / 18));
+  const samples = passengerRoute.filter((_, index) => index % step === 0);
+  const lastPassengerPoint = passengerRoute[passengerRoute.length - 1];
+
+  if (samples[samples.length - 1] !== lastPassengerPoint) {
+    samples.push(lastPassengerPoint);
+  }
+
+  const nearSamples = samples.filter((sample) => {
+    const position = nearestRoutePosition(sample, driverRoute);
+    return position ? position.distanceKm <= 1.8 : false;
+  });
+
+  return nearSamples.length / samples.length;
+}
+
+function decodeDriverRoute(route: DriverRouteRow) {
+  if (route.route_polyline) {
+    try {
+      const decoded = decodeRoutePolyline(route.route_polyline);
+
+      if (decoded.length >= 2) {
+        return decoded;
+      }
+    } catch {
+      // Fall back to start and destination if a stored polyline is malformed.
+    }
+  }
+
+  return [
+    { latitude: route.start_latitude, longitude: route.start_longitude },
+    { latitude: route.destination_latitude, longitude: route.destination_longitude },
+  ];
 }
 
 async function countRows(table: string, filters?: (query: any) => any) {
@@ -360,6 +562,7 @@ export async function listDrivers(options?: {
   approvedOnly?: boolean;
   driverProfileIds?: string[];
   onlineOnly?: boolean;
+  staleLocationMinutes?: number;
   withLocationOnly?: boolean;
   limit?: number;
 }) {
@@ -386,9 +589,16 @@ export async function listDrivers(options?: {
   }
 
   if (options?.withLocationOnly) {
+    const staleLocationMinutes =
+      options.staleLocationMinutes ?? DRIVER_LOCATION_STALE_MINUTES;
+    const minimumLocationTime = new Date(
+      Date.now() - staleLocationMinutes * 60 * 1000
+    ).toISOString();
+
     query = query
       .not("current_latitude", "is", null)
-      .not("current_longitude", "is", null);
+      .not("current_longitude", "is", null)
+      .gte("last_location_at", minimumLocationTime);
   }
 
   const { data, error } = await query;
@@ -396,7 +606,12 @@ export async function listDrivers(options?: {
   return enrichDrivers((data ?? []) as DriverProfileRow[]);
 }
 
-function scoreRouteMatch(driver: DriverSummary, pickup: RoutePointInput, destination: RoutePointInput) {
+function scoreRouteMatch(
+  driver: DriverSummary,
+  pickup: RoutePointInput,
+  destination: RoutePointInput,
+  passengerRouteCoordinates?: RouteCoordinateInput[]
+) {
   if (typeof driver.currentLatitude !== "number" || typeof driver.currentLongitude !== "number") {
     return null;
   }
@@ -415,28 +630,61 @@ function scoreRouteMatch(driver: DriverSummary, pickup: RoutePointInput, destina
       : null;
   }
 
-  const startDistanceKm = distanceKm(
-    {
-      latitude: driver.activeRoute.start_latitude,
-      longitude: driver.activeRoute.start_longitude,
-    },
-    pickup
-  );
-  const destinationDistanceKm = distanceKm(
-    {
-      latitude: driver.activeRoute.destination_latitude,
-      longitude: driver.activeRoute.destination_longitude,
-    },
-    destination
-  );
+  const driverRoute = decodeDriverRoute(driver.activeRoute);
+  const passengerRoute =
+    passengerRouteCoordinates && passengerRouteCoordinates.length >= 2
+      ? passengerRouteCoordinates
+      : [pickup, destination];
+  const pickupPosition = nearestRoutePosition(pickup, driverRoute);
+  const destinationPosition = nearestRoutePosition(destination, driverRoute);
 
-  if (distanceToPickupKm > 25 || startDistanceKm > 18 || destinationDistanceKm > 25) {
+  if (!pickupPosition || !destinationPosition) {
     return null;
+  }
+
+  const hasDetailedPassengerRoute = passengerRouteCoordinates && passengerRouteCoordinates.length >= 2;
+  const nearRouteRatio = hasDetailedPassengerRoute
+    ? routeNearnessRatio(passengerRoute, driverRoute)
+    : 1;
+  const passengerRouteLengthKm = Math.max(routeLengthKm(passengerRoute), distanceKm(pickup, destination));
+  const sharedDriverSegmentKm = destinationPosition.progressKm - pickupPosition.progressKm;
+  const routeLengthDifferenceRatio =
+    passengerRouteLengthKm > 0
+      ? Math.abs(sharedDriverSegmentKm - passengerRouteLengthKm) / passengerRouteLengthKm
+      : 0;
+
+  if (
+    distanceToPickupKm > 20 ||
+    pickupPosition.distanceKm > 2.5 ||
+    destinationPosition.distanceKm > 3.5 ||
+    sharedDriverSegmentKm <= 0.5 ||
+    (hasDetailedPassengerRoute && nearRouteRatio < 0.65) ||
+    (hasDetailedPassengerRoute && routeLengthDifferenceRatio > 0.55)
+  ) {
+    return null;
+  }
+
+  if (!hasDetailedPassengerRoute) {
+    const driverBearing = bearingDegrees(driverRoute[0], driverRoute[driverRoute.length - 1]);
+    const passengerBearing = bearingDegrees(pickup, destination);
+    const directionDifference = bearingDifferenceDegrees(driverBearing, passengerBearing);
+
+    if (directionDifference > 55) {
+      return null;
+    }
   }
 
   const score = Math.max(
     0,
-    Math.min(100, 100 - distanceToPickupKm * 3 - startDistanceKm * 2 - destinationDistanceKm * 2)
+    Math.min(
+      100,
+      100 -
+        distanceToPickupKm * 3 -
+        pickupPosition.distanceKm * 10 -
+        destinationPosition.distanceKm * 12 -
+        (1 - nearRouteRatio) * 35 -
+        routeLengthDifferenceRatio * 20
+    )
   );
 
   return {
@@ -449,17 +697,24 @@ export async function listRouteMatchedDrivers(input: {
   destination: RoutePointInput;
   limit?: number;
   pickup: RoutePointInput;
+  routeCoordinates?: RouteCoordinateInput[];
 }) {
   const drivers = await listDrivers({
     availabilityStatusIds: [STATUS.AVAILABILITY_ONLINE, STATUS.AVAILABILITY_BUSY],
     approvedOnly: true,
+    staleLocationMinutes: DRIVER_LOCATION_STALE_MINUTES,
     withLocationOnly: true,
     limit: 100,
   });
   const matchedDrivers: DriverSummary[] = [];
 
   for (const driver of drivers) {
-    const match = scoreRouteMatch(driver, input.pickup, input.destination);
+    const match = scoreRouteMatch(
+      driver,
+      input.pickup,
+      input.destination,
+      input.routeCoordinates
+    );
 
     if (match) {
       matchedDrivers.push({
@@ -642,6 +897,7 @@ export async function getPassengerDashboard(profileId: string): Promise<Passenge
     listDrivers({
       availabilityStatusIds: [STATUS.AVAILABILITY_ONLINE, STATUS.AVAILABILITY_BUSY],
       approvedOnly: true,
+      staleLocationMinutes: DRIVER_LOCATION_STALE_MINUTES,
       withLocationOnly: true,
       limit: 20,
     }),
@@ -711,9 +967,12 @@ export async function createTransportRequest(input: {
   passengerId: string;
   passengerNote?: string;
   pickup: RoutePointInput;
+  routeCoordinates?: RouteCoordinateInput[];
 }) {
   const [selectedDriver] = await listDrivers({
     driverProfileIds: [input.driverProfileId],
+    staleLocationMinutes: DRIVER_LOCATION_STALE_MINUTES,
+    withLocationOnly: true,
     limit: 1,
   });
 
@@ -731,6 +990,19 @@ export async function createTransportRequest(input: {
 
   if (selectedDriver.availabilityStatusId !== STATUS.AVAILABILITY_ONLINE) {
     throw new Error("This driver is offline right now. Choose another nearby driver.");
+  }
+
+  const match = scoreRouteMatch(
+    selectedDriver,
+    input.pickup,
+    input.destination,
+    input.routeCoordinates
+  );
+
+  if (!match) {
+    throw new Error(
+      "This driver is no longer a good route match for the selected trip. Choose another nearby driver."
+    );
   }
 
   const { data, error } = await supabase
@@ -751,8 +1023,6 @@ export async function createTransportRequest(input: {
     .single();
 
   formatError(error);
-
-  const match = selectedDriver ? scoreRouteMatch(selectedDriver, input.pickup, input.destination) : null;
 
   if (selectedDriver) {
     const { error: matchError } = await supabase.from("route_matches").insert({
@@ -982,7 +1252,8 @@ export async function updateDriverVehicle(input: {
 
 export async function updateUserAccountStatus(
   profileId: string,
-  accountStatusId: number
+  accountStatusId: number,
+  adminId?: string | null
 ) {
   const { data, error } = await supabase
     .from("profiles")
@@ -994,6 +1265,14 @@ export async function updateUserAccountStatus(
     .single();
 
   formatError(error);
+  await recordAdminAuditLog({
+    action: "user_account_status_updated",
+    adminId,
+    entityId: profileId,
+    entityTable: "profiles",
+    metadata: { accountStatusId },
+  });
+
   return data as Profile;
 }
 
@@ -1035,7 +1314,8 @@ export async function saveDriverRoute(input: {
 export async function updateDriverVerification(
   driverProfileId: string,
   verificationStatusId: number,
-  note?: string
+  note?: string,
+  adminId?: string | null
 ) {
   const { error } = await supabase
     .from("driver_profiles")
@@ -1058,9 +1338,21 @@ export async function updateDriverVerification(
         verificationStatusId === STATUS.VERIFICATION_REJECTED
           ? note?.trim() || "Verification rejected by admin."
           : null,
+      reviewed_by: adminId ?? null,
       reviewed_at: new Date().toISOString(),
     })
     .eq("driver_profile_id", driverProfileId);
+
+  await recordAdminAuditLog({
+    action: "driver_verification_updated",
+    adminId,
+    entityId: driverProfileId,
+    entityTable: "driver_profiles",
+    metadata: {
+      note: note?.trim() || null,
+      verificationStatusId,
+    },
+  });
 }
 
 export async function submitDriverVerification(input: {
@@ -1070,7 +1362,13 @@ export async function submitDriverVerification(input: {
   const cleanDocumentUrl = input.documentUrl.trim();
 
   if (!cleanDocumentUrl) {
-    throw new Error("Add a document link before submitting verification.");
+    throw new Error("Add a Supabase Storage document URL before submitting verification.");
+  }
+
+  if (!isDriverVerificationStorageUrl(cleanDocumentUrl)) {
+    throw new Error(
+      `Upload the document to Supabase Storage bucket "${DRIVER_VERIFICATION_STORAGE_BUCKET}" and submit the generated storage URL.`
+    );
   }
 
   const { data: existing, error: lookupError } = await supabase
@@ -1120,6 +1418,38 @@ export async function createReport(input: {
   transportRequestId?: string;
   reportedUserId?: string;
 }) {
+  const title = input.title.trim();
+  const description = input.description.trim();
+
+  if (title.length < 3 || description.length < 10) {
+    throw new Error("Add a clear title and at least 10 characters before submitting a report.");
+  }
+
+  const recentWindowStart = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  const { data: recentReports, error: recentReportsError } = await supabase
+    .from("reports")
+    .select("id,title,description,created_at")
+    .eq("reporter_id", input.reporterId)
+    .gte("created_at", recentWindowStart)
+    .order("created_at", { ascending: false })
+    .limit(10);
+
+  formatError(recentReportsError);
+
+  if ((recentReports ?? []).length >= 3) {
+    throw new Error("Please wait before submitting another report. Recent reports are being reviewed.");
+  }
+
+  const duplicateReport = (recentReports ?? []).some(
+    (report) =>
+      normalizeReportText(report.title) === normalizeReportText(title) &&
+      normalizeReportText(report.description) === normalizeReportText(description)
+  );
+
+  if (duplicateReport) {
+    throw new Error("A similar report was already submitted recently.");
+  }
+
   const { data, error } = await supabase
     .from("reports")
     .insert({
@@ -1128,8 +1458,8 @@ export async function createReport(input: {
       transport_request_id: input.transportRequestId ?? null,
       report_type_id: input.reportTypeId ?? 4000,
       report_status_id: STATUS.REPORT_PENDING,
-      title: input.title.trim(),
-      description: input.description.trim(),
+      title,
+      description,
     })
     .select("*")
     .single();
@@ -1155,4 +1485,14 @@ export async function updateReportStatus(
     .eq("id", reportId);
 
   formatError(error);
+  await recordAdminAuditLog({
+    action: "report_status_updated",
+    adminId,
+    entityId: reportId,
+    entityTable: "reports",
+    metadata: {
+      note: note?.trim() || null,
+      statusId,
+    },
+  });
 }

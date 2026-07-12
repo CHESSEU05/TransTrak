@@ -1,6 +1,6 @@
 import { Text, View } from "react-native";
 import { Bike, Car } from "lucide-react-native";
-import MapView, { Marker, Polyline } from "react-native-maps";
+import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from "react-native-maps";
 import type { Region } from "react-native-maps";
 
 import { colors } from "../../constants/colors";
@@ -112,7 +112,7 @@ export function RouteMap({
     <View className="overflow-hidden rounded-2xl border border-divider bg-surface">
       <MapView
         initialRegion={region}
-        showsUserLocation
+        provider={PROVIDER_GOOGLE}
         style={{ height: 210, width: "100%" }}
       >
         {pickup ? (

@@ -50,6 +50,8 @@ import { useAuth } from "../../context/AuthContext";
 import {
   createReport,
   createTransportRequest,
+  DRIVER_LOCATION_STALE_MINUTES,
+  DRIVER_VERIFICATION_STORAGE_BUCKET,
   getAdminDashboard,
   getDriverDashboard,
   getPassengerDashboard,
@@ -614,25 +616,46 @@ function PlaceInput({
     }
   }
 
+  function clearInput() {
+    setText("");
+    setPredictions([]);
+    setError(null);
+    onChangeText?.("");
+  }
+
   return (
     <View>
       <View className="flex-row items-center justify-between">
         <Text className="font-jakarta-semibold text-sm text-text">{label}</Text>
         {loading ? <ActivityIndicator color={colors.primary} /> : null}
       </View>
-      <TextInput
-        value={text}
-        onChangeText={(nextText) => {
-          setText(nextText);
-          setError(null);
-          onChangeText?.(nextText);
-        }}
-        placeholder={placeholder}
-        placeholderTextColor={colors.textSecondary}
-        className={`mt-2 h-12 rounded-xl border bg-background px-4 font-jakarta text-text ${
+      <View
+        className={`mt-2 h-12 flex-row items-center rounded-xl border bg-background ${
           selected ? "border-success" : "border-divider"
         }`}
-      />
+      >
+        <TextInput
+          value={text}
+          onChangeText={(nextText) => {
+            setText(nextText);
+            setError(null);
+            onChangeText?.(nextText);
+          }}
+          placeholder={placeholder}
+          placeholderTextColor={colors.textSecondary}
+          className="h-12 flex-1 px-4 pr-2 font-jakarta text-text"
+        />
+        {text.length > 0 ? (
+          <TouchableOpacity
+            accessibilityLabel={`Clear ${label.toLowerCase()}`}
+            activeOpacity={0.75}
+            onPress={clearInput}
+            className="mr-2 h-8 w-8 items-center justify-center rounded-full bg-divider"
+          >
+            <X color={colors.textSecondary} size={16} />
+          </TouchableOpacity>
+        ) : null}
+      </View>
       <View className="mt-2 flex-row flex-wrap gap-2">
         {selected ? (
           <View className="flex-row items-center rounded-full bg-success/10 px-3 py-2">
@@ -1390,7 +1413,10 @@ function DriverVerificationPanel({
     }
 
     if (!documentUrl.trim()) {
-      Alert.alert("Document needed", "Add a public document link for admin verification.");
+      Alert.alert(
+        "Document needed",
+        `Upload the document to Supabase Storage bucket "${DRIVER_VERIFICATION_STORAGE_BUCKET}" and paste the generated URL.`
+      );
       return;
     }
 
@@ -1420,7 +1446,7 @@ function DriverVerificationPanel({
           <View className="flex-1">
             <Text className="font-jakarta-bold text-base text-text">Driver verification</Text>
             <Text className="mt-1 font-jakarta text-sm text-textSecondary">
-              Submit your license, ID card, or vehicle document link for admin approval.
+              Submit a Supabase Storage link for your license, ID card, or vehicle document.
             </Text>
           </View>
         </View>
@@ -1439,16 +1465,19 @@ function DriverVerificationPanel({
         </Text>
       ) : null}
 
-      <Text className="mt-4 font-jakarta-semibold text-sm text-text">Document URL</Text>
+      <Text className="mt-4 font-jakarta-semibold text-sm text-text">Supabase Storage URL</Text>
       <TextInput
         value={documentUrl}
         onChangeText={setDocumentUrl}
-        placeholder="https://..."
+        placeholder={`https://.../storage/v1/object/.../${DRIVER_VERIFICATION_STORAGE_BUCKET}/...`}
         placeholderTextColor={colors.textSecondary}
         autoCapitalize="none"
         keyboardType="url"
         className="mt-2 h-12 rounded-xl border border-divider bg-background px-4 font-jakarta text-text"
       />
+      <Text className="mt-2 font-jakarta text-xs text-textSecondary">
+        Only files uploaded to the {DRIVER_VERIFICATION_STORAGE_BUCKET} bucket are accepted.
+      </Text>
       <View className="mt-4 flex-row gap-3">
         <PrimaryButton
           label={verification?.documentUrl ? "Resubmit" : "Submit"}
@@ -1520,6 +1549,9 @@ function ReportComposer({
   return (
     <View className="rounded-2xl border border-divider bg-surface p-4">
       <Text className="font-jakarta-bold text-base text-text">Submit a report</Text>
+      <Text className="mt-1 font-jakarta text-sm text-textSecondary">
+        Reports are checked for duplicates and repeated submissions so administrators can focus on genuine safety issues.
+      </Text>
       <Text className="mt-4 font-jakarta-semibold text-sm text-text">Report type</Text>
       <View className="mt-2 flex-row flex-wrap gap-2">
         {REPORT_TYPES.map((type) => {
@@ -1748,6 +1780,7 @@ export function PassengerSearchScreen() {
         const matchedDrivers = await listRouteMatchedDrivers({
           pickup: toRoutePoint(pickupPlace),
           destination: toRoutePoint(destinationPlace),
+          routeCoordinates: metrics?.coordinates ?? undefined,
           limit: 12,
         });
 
@@ -1811,6 +1844,7 @@ export function PassengerSearchScreen() {
         driverProfileId: driver.id,
         pickup: toRoutePoint(pickupPlace),
         destination: toRoutePoint(destinationPlace),
+        routeCoordinates: routeMetrics?.coordinates ?? undefined,
         passengerNote: routeMetrics
           ? `Route-aware request. Estimated trip: ${formatDistanceMeters(
               routeMetrics.distanceMeters
@@ -2221,10 +2255,20 @@ export function DriverHomeScreen() {
                 tone="outline"
               />
             </View>
-            <Text className="mt-3 font-jakarta text-xs text-textSecondary">
-              Busy keeps your last shared location visible to passengers, but they cannot send a
-              request until you are online again.
-            </Text>
+            <View className="mt-3 gap-2">
+              <InlineNotice
+                message={`Online shares your latest location with nearby passengers. Locations older than ${DRIVER_LOCATION_STALE_MINUTES} minutes are hidden automatically.`}
+                tone="info"
+              />
+              <InlineNotice
+                message="Busy keeps you visible for an active trip, but passengers cannot send a new request until you return online."
+                tone="warning"
+              />
+              <InlineNotice
+                message="Offline stops new discovery and avoids refreshing your shared driver location."
+                tone="info"
+              />
+            </View>
           </View>
         </>
       ) : null}
@@ -2675,7 +2719,7 @@ export function AdminUsersScreen() {
     setUpdatingId(user.id);
 
     try {
-      await updateUserAccountStatus(user.id, statusId);
+      await updateUserAccountStatus(user.id, statusId, profile?.id);
       await resource.refresh();
     } catch (error) {
       Alert.alert("Account update failed", error instanceof Error ? error.message : "Try again.");
@@ -2824,6 +2868,7 @@ export function AdminUsersScreen() {
 }
 
 export function AdminDriversScreen() {
+  const { profile } = useAuth();
   const resource = useAsyncResource(getAdminDashboard, []);
   const drivers = resource.data?.drivers ?? [];
   const [updatingId, setUpdatingId] = useState<string | null>(null);
@@ -2833,7 +2878,7 @@ export function AdminDriversScreen() {
     setUpdatingId(driverId);
 
     try {
-      await updateDriverVerification(driverId, statusId);
+      await updateDriverVerification(driverId, statusId, undefined, profile?.id);
       await resource.refresh();
     } catch (error) {
       Alert.alert("Verification update failed", error instanceof Error ? error.message : "Try again.");
@@ -3092,11 +3137,12 @@ function ProfileSectionPanel({
     permissions: [
       "Location access is needed to show nearby drivers, compute pickup distance, and update live trip progress.",
       "Notification permission is useful for new requests, accepted trips, verification updates, and report decisions.",
-      "If location is not shared, the app shows a polite message instead of static or misleading map data.",
+      `Driver locations older than ${DRIVER_LOCATION_STALE_MINUTES} minutes are hidden instead of shown as live positions.`,
     ],
     privacy: [
       "Your live location is used for transport discovery, matching, and active trip tracking.",
-      "Driver verification details are reviewed by administrators and should only be used for platform safety.",
+      "Drivers share location only while online, busy, or actively updating an accepted request.",
+      `Driver verification documents must be stored in the ${DRIVER_VERIFICATION_STORAGE_BUCKET} Supabase Storage bucket for administrator review.`,
       "Use logout on shared devices and report suspicious activity from the reports screen.",
     ],
     terms: [
