@@ -920,12 +920,14 @@ function SectionTitle({ title, action }: { title: string; action?: ReactNode }) 
 
 function PrimaryButton({
   disabled,
+  fullWidth,
   label,
   loading,
   onPress,
   tone = "primary",
 }: {
   disabled?: boolean;
+  fullWidth?: boolean;
   label: string;
   loading?: boolean;
   onPress: () => void;
@@ -940,7 +942,9 @@ function PrimaryButton({
       activeOpacity={0.85}
       disabled={disabled || loading}
       onPress={onPress}
-      className={`h-12 min-w-32 flex-1 items-center justify-center rounded-xl ${
+      className={`h-12 items-center justify-center rounded-xl ${
+        fullWidth ? "w-full" : "min-w-32 flex-1"
+      } ${
         disabled || loading ? "opacity-50" : ""
       }`}
       style={{
@@ -2422,15 +2426,17 @@ export function DriverHomeScreen() {
           <MapLegend />
           <View className="rounded-2xl border border-divider bg-surface p-4">
             <SectionTitle title="Availability" />
-            <View className="mt-4 flex-row gap-3">
+            <View className="mt-4 gap-3">
               <PrimaryButton
                 disabled={!canOperate}
+                fullWidth
                 label="Online"
                 loading={isUpdating}
                 onPress={() => handleAvailability(STATUS.AVAILABILITY_ONLINE)}
               />
               <PrimaryButton
                 disabled={!canOperate}
+                fullWidth
                 label="Busy"
                 loading={isUpdating}
                 onPress={() => handleAvailability(STATUS.AVAILABILITY_BUSY)}
@@ -2438,6 +2444,7 @@ export function DriverHomeScreen() {
               />
               <PrimaryButton
                 disabled={!canOperate}
+                fullWidth
                 label="Offline"
                 loading={isUpdating}
                 onPress={() => handleAvailability(STATUS.AVAILABILITY_OFFLINE)}
