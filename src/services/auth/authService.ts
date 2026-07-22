@@ -308,6 +308,11 @@ export async function registerUser(input: RegisterInput): Promise<RegisterUserRe
 
   if (error) {
     authDebugError('signup:error', error, { email: normalizedEmail, roleId });
+
+    if (error.message.toLowerCase().includes('email signups are disabled')) {
+      throw new Error('Email sign up is disabled in Supabase. Enable the Email provider and try again.');
+    }
+
     throw new Error(error.message);
   }
 
@@ -366,8 +371,17 @@ export async function loginUser(input: LoginInput) {
 
   if (error) {
     authDebugError('login:error', error, { email: input.email });
+    const lowerMessage = error.message.toLowerCase();
 
-    if (error.message.toLowerCase().includes('email not confirmed')) {
+    if (lowerMessage.includes('invalid login credentials')) {
+      throw new Error('The email or password is not correct. Please check both and try again.');
+    }
+
+    if (lowerMessage.includes('email logins are disabled')) {
+      throw new Error('Email login is disabled in Supabase. Enable the Email provider and try again.');
+    }
+
+    if (lowerMessage.includes('email not confirmed')) {
       throw new Error(
         'This account still requires email confirmation. Disable email confirmation in Supabase, delete this test user, and register again.'
       );

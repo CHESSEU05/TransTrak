@@ -1,5 +1,6 @@
-import { supabase } from "../supabase/client";
 import type { Profile } from "../../types/auth";
+import { decodeRoutePolyline } from "../location/googlePlacesService";
+import { supabase } from "../supabase/client";
 
 export const STATUS = {
   ACCOUNT_ACTIVE: 1000,
@@ -28,23 +29,26 @@ export const STATUS = {
   ROLE_ADMIN: 3000,
 } as const;
 
-export const PLACES = {
-  pickup: {
-    name: "Molyko, Buea",
-    latitude: 4.1538,
-    longitude: 9.292,
-  },
-  destination: {
-    name: "Mile 17, Buea",
-    latitude: 4.1519,
-    longitude: 9.2781,
-  },
-  driver: {
-    name: "Clerks Quarters, Buea",
-    latitude: 4.1581,
-    longitude: 9.2864,
-  },
-} as const;
+export const REPORT_TYPES = [
+  { id: 1000, label: "Safety issue" },
+  { id: 2000, label: "Driver or passenger behaviour" },
+  { id: 3000, label: "Wrong route or vehicle information" },
+  { id: 4000, label: "Other concern" },
+] as const;
+
+export const DRIVER_LOCATION_STALE_MINUTES = 20;
+export const DRIVER_VERIFICATION_STORAGE_BUCKET = "driver-verifications";
+
+export type RoutePointInput = {
+  latitude: number;
+  longitude: number;
+  name: string;
+};
+
+export type RouteCoordinateInput = {
+  latitude: number;
+  longitude: number;
+};
 
 type DriverProfileRow = {
   id: string;
@@ -76,6 +80,7 @@ type DriverRouteRow = {
   start_longitude: number;
   destination_latitude: number;
   destination_longitude: number;
+  route_polyline: string | null;
   route_status_id: number;
   started_at: string;
   ended_at: string | null;
@@ -115,6 +120,36 @@ type ReportRow = {
   created_at: string;
 };
 
+type DriverVerificationRow = {
+  id: string;
+  driver_profile_id: string;
+  verification_status_id: number;
+  document_url: string | null;
+  submitted_at: string;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+  rejection_reason: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type ExternalTripReportRow = {
+  id: string;
+  trip_share_link_id: string;
+  transport_request_id: string;
+  reporter_name: string;
+  reporter_phone: string;
+  reporter_relationship: string | null;
+  concern_type: string;
+  description: string;
+  report_status_id: number;
+  resolved_by: string | null;
+  resolved_at: string | null;
+  resolution_note: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type DriverSummary = {
   id: string;
   profileId: string;
@@ -123,8 +158,8 @@ export type DriverSummary = {
   avatarUrl: string | null;
   availabilityStatusId: number;
   verificationStatusId: number;
-  currentLatitude: number;
-  currentLongitude: number;
+  currentLatitude: number | null;
+  currentLongitude: number | null;
   lastLocationAt: string | null;
   vehicleId: string | null;
   vehicleTypeId: number | null;
@@ -133,6 +168,8 @@ export type DriverSummary = {
   vehicleLabel: string;
   plateNumber: string | null;
   activeRoute: DriverRouteRow | null;
+  distanceToPickupKm?: number;
+  routeAlignmentScore?: number;
 };
 
 export type TransportRequestSummary = {
@@ -142,6 +179,7 @@ export type TransportRequestSummary = {
   passengerName: string;
   driverName: string;
   vehicleLabel: string;
+  vehicleTypeId: number | null;
   plateNumber: string | null;
   pickupName: string;
   destinationName: string;
@@ -152,6 +190,9 @@ export type TransportRequestSummary = {
   requestStatusId: number;
   passengerNote: string | null;
   requestedAt: string;
+  driverCurrentLatitude: number | null;
+  driverCurrentLongitude: number | null;
+  driverProfileUserId: string | null;
 };
 
 export type ReportSummary = {
@@ -162,7 +203,47 @@ export type ReportSummary = {
   reportStatusId: number;
   reporterName: string;
   reportedUserName: string | null;
+  transportRequestId: string | null;
+  resolutionNote: string | null;
+  resolvedAt: string | null;
   createdAt: string;
+};
+
+export type ExternalSafetyReportSummary = {
+  id: string;
+  tripShareLinkId: string;
+  transportRequestId: string;
+  reporterName: string;
+  reporterPhone: string;
+  reporterRelationship: string | null;
+  concernType: string;
+  description: string;
+  reportStatusId: number;
+  pickupName: string;
+  destinationName: string;
+  passengerName: string;
+  driverName: string;
+  vehicleLabel: string;
+  plateNumber: string | null;
+  resolvedAt: string | null;
+  resolutionNote: string | null;
+  createdAt: string;
+};
+
+export type TripSafetyShareLink = {
+  expiresAt: string;
+  id: string;
+  shareUrl: string;
+  token: string;
+};
+
+export type DriverVerificationSummary = {
+  id: string;
+  documentUrl: string | null;
+  rejectionReason: string | null;
+  reviewedAt: string | null;
+  statusId: number;
+  submittedAt: string;
 };
 
 export type PassengerDashboardData = {
@@ -175,6 +256,7 @@ export type DriverDashboardData = {
   driver: DriverSummary | null;
   requests: TransportRequestSummary[];
   reports: ReportSummary[];
+  verification: DriverVerificationSummary | null;
 };
 
 export type AdminDashboardData = {
@@ -185,6 +267,7 @@ export type AdminDashboardData = {
   users: Profile[];
   drivers: DriverSummary[];
   reports: ReportSummary[];
+  externalSafetyReports: ExternalSafetyReportSummary[];
 };
 
 function byId<T extends { id: string }>(rows: T[]) {
@@ -218,14 +301,255 @@ function vehicleName(vehicle?: VehicleRow) {
   return model ? `${type} - ${model}` : type;
 }
 
-function fallbackCoordinate(value: number | null, fallback: number) {
-  return typeof value === "number" ? value : fallback;
-}
-
 function formatError(error: { message: string } | null) {
   if (error) {
     throw new Error(error.message);
   }
+}
+
+async function recordAdminAuditLog(input: {
+  action: string;
+  adminId?: string | null;
+  entityId: string;
+  entityTable: string;
+  metadata?: Record<string, unknown>;
+}) {
+  if (!input.adminId) {
+    return;
+  }
+
+  try {
+    const { error } = await supabase.from("admin_audit_logs").insert({
+      actor_id: input.adminId,
+      action: input.action,
+      entity_table: input.entityTable,
+      entity_id: input.entityId,
+      metadata: input.metadata ?? {},
+    });
+
+    if (error) {
+      console.warn("Admin audit log was not saved:", error.message);
+    }
+  } catch (error) {
+    console.warn(
+      "Admin audit log was not saved:",
+      error instanceof Error ? error.message : "Unknown error"
+    );
+  }
+}
+
+function isDriverVerificationStorageUrl(value: string) {
+  try {
+    const url = new URL(value);
+    const path = url.pathname.toLowerCase();
+
+    return (
+      path.includes("/storage/v1/object/") &&
+      path.includes(`/${DRIVER_VERIFICATION_STORAGE_BUCKET.toLowerCase()}/`)
+    );
+  } catch {
+    const normalized = value.toLowerCase();
+
+    return (
+      normalized.startsWith(`${DRIVER_VERIFICATION_STORAGE_BUCKET.toLowerCase()}/`) ||
+      normalized.startsWith(`supabase://${DRIVER_VERIFICATION_STORAGE_BUCKET.toLowerCase()}/`)
+    );
+  }
+}
+
+function normalizeReportText(value: string) {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function tripShareBaseUrl() {
+  return process.env.EXPO_PUBLIC_TRIP_SHARE_BASE_URL?.trim().replace(/\/+$/, "") ?? "";
+}
+
+function tripShareApiUrl() {
+  const configuredUrl = process.env.EXPO_PUBLIC_TRIP_SHARE_API_URL?.trim().replace(/\/+$/, "");
+
+  if (configuredUrl) {
+    return configuredUrl;
+  }
+
+  const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL?.trim();
+  const match = supabaseUrl?.match(/^https:\/\/([^.]+)\.supabase\.co\/?$/);
+
+  return match ? `https://${match[1]}.supabase.co/functions/v1/shared-trip` : "";
+}
+
+function buildTripShareUrl(token: string) {
+  const baseUrl = tripShareBaseUrl();
+  const apiUrl = tripShareApiUrl();
+
+  if (!baseUrl) {
+    throw new Error(
+      "Trip sharing is not configured yet. Add EXPO_PUBLIC_TRIP_SHARE_BASE_URL before sharing safety links."
+    );
+  }
+
+  const url = new URL(baseUrl);
+  url.searchParams.set("token", token);
+
+  if (apiUrl) {
+    url.searchParams.set("api", apiUrl);
+  }
+
+  return url.toString();
+}
+
+function distanceKm(a: { latitude: number; longitude: number }, b: { latitude: number; longitude: number }) {
+  const toRadians = (value: number) => (value * Math.PI) / 180;
+  const radiusKm = 6371;
+  const dLat = toRadians(b.latitude - a.latitude);
+  const dLon = toRadians(b.longitude - a.longitude);
+  const lat1 = toRadians(a.latitude);
+  const lat2 = toRadians(b.latitude);
+
+  const haversine =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.sin(dLon / 2) * Math.sin(dLon / 2) * Math.cos(lat1) * Math.cos(lat2);
+
+  return radiusKm * 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
+}
+
+function routeLengthKm(route: RouteCoordinateInput[]) {
+  return route.reduce((total, point, index) => {
+    if (index === 0) {
+      return total;
+    }
+
+    return total + distanceKm(route[index - 1], point);
+  }, 0);
+}
+
+function toLocalKm(point: RouteCoordinateInput, origin: RouteCoordinateInput) {
+  const toRadians = (value: number) => (value * Math.PI) / 180;
+  const radiusKm = 6371;
+  const latitude = toRadians(point.latitude - origin.latitude) * radiusKm;
+  const longitude =
+    toRadians(point.longitude - origin.longitude) *
+    radiusKm *
+    Math.cos(toRadians((point.latitude + origin.latitude) / 2));
+
+  return { latitude, longitude };
+}
+
+function nearestRoutePosition(point: RouteCoordinateInput, route: RouteCoordinateInput[]) {
+  if (route.length === 0) {
+    return null;
+  }
+
+  if (route.length === 1) {
+    return {
+      distanceKm: distanceKm(point, route[0]),
+      progressKm: 0,
+    };
+  }
+
+  let travelledKm = 0;
+  let best: { distanceKm: number; progressKm: number } | null = null;
+
+  for (let index = 1; index < route.length; index += 1) {
+    const start = route[index - 1];
+    const end = route[index];
+    const segmentLengthKm = distanceKm(start, end);
+
+    if (segmentLengthKm === 0) {
+      continue;
+    }
+
+    const pointKm = toLocalKm(point, start);
+    const endKm = toLocalKm(end, start);
+    const segmentLengthSquared =
+      endKm.latitude * endKm.latitude + endKm.longitude * endKm.longitude;
+    const progressRatio =
+      segmentLengthSquared === 0
+        ? 0
+        : Math.max(
+            0,
+            Math.min(
+              1,
+              (pointKm.latitude * endKm.latitude + pointKm.longitude * endKm.longitude) /
+                segmentLengthSquared
+            )
+          );
+    const closest = {
+      latitude: start.latitude + (end.latitude - start.latitude) * progressRatio,
+      longitude: start.longitude + (end.longitude - start.longitude) * progressRatio,
+    };
+    const candidate = {
+      distanceKm: distanceKm(point, closest),
+      progressKm: travelledKm + segmentLengthKm * progressRatio,
+    };
+
+    if (!best || candidate.distanceKm < best.distanceKm) {
+      best = candidate;
+    }
+
+    travelledKm += segmentLengthKm;
+  }
+
+  return best;
+}
+
+function bearingDegrees(from: RouteCoordinateInput, to: RouteCoordinateInput) {
+  const toRadians = (value: number) => (value * Math.PI) / 180;
+  const toDegrees = (value: number) => (value * 180) / Math.PI;
+  const startLat = toRadians(from.latitude);
+  const endLat = toRadians(to.latitude);
+  const longitudeDelta = toRadians(to.longitude - from.longitude);
+  const y = Math.sin(longitudeDelta) * Math.cos(endLat);
+  const x =
+    Math.cos(startLat) * Math.sin(endLat) -
+    Math.sin(startLat) * Math.cos(endLat) * Math.cos(longitudeDelta);
+
+  return (toDegrees(Math.atan2(y, x)) + 360) % 360;
+}
+
+function bearingDifferenceDegrees(first: number, second: number) {
+  const difference = Math.abs(first - second) % 360;
+  return difference > 180 ? 360 - difference : difference;
+}
+
+function routeNearnessRatio(passengerRoute: RouteCoordinateInput[], driverRoute: RouteCoordinateInput[]) {
+  if (passengerRoute.length === 0 || driverRoute.length === 0) {
+    return 0;
+  }
+
+  const step = Math.max(1, Math.floor(passengerRoute.length / 18));
+  const samples = passengerRoute.filter((_, index) => index % step === 0);
+  const lastPassengerPoint = passengerRoute[passengerRoute.length - 1];
+
+  if (samples[samples.length - 1] !== lastPassengerPoint) {
+    samples.push(lastPassengerPoint);
+  }
+
+  const nearSamples = samples.filter((sample) => {
+    const position = nearestRoutePosition(sample, driverRoute);
+    return position ? position.distanceKm <= 1.8 : false;
+  });
+
+  return nearSamples.length / samples.length;
+}
+
+function decodeDriverRoute(route: DriverRouteRow) {
+  if (route.route_polyline) {
+    try {
+      const decoded = decodeRoutePolyline(route.route_polyline);
+
+      if (decoded.length >= 2) {
+        return decoded;
+      }
+    } catch {
+      // Fall back to start and destination if a stored polyline is malformed.
+    }
+  }
+
+  return [
+    { latitude: route.start_latitude, longitude: route.start_longitude },
+    { latitude: route.destination_latitude, longitude: route.destination_longitude },
+  ];
 }
 
 async function countRows(table: string, filters?: (query: any) => any) {
@@ -302,8 +626,8 @@ async function enrichDrivers(rows: DriverProfileRow[]) {
       avatarUrl: profile?.avatar_url ?? null,
       availabilityStatusId: row.availability_status_id,
       verificationStatusId: row.verification_status_id,
-      currentLatitude: fallbackCoordinate(row.current_latitude, PLACES.driver.latitude),
-      currentLongitude: fallbackCoordinate(row.current_longitude, PLACES.driver.longitude),
+      currentLatitude: row.current_latitude,
+      currentLongitude: row.current_longitude,
       lastLocationAt: row.last_location_at,
       vehicleId: vehicle?.id ?? null,
       vehicleTypeId: vehicle?.vehicle_type_id ?? null,
@@ -317,8 +641,12 @@ async function enrichDrivers(rows: DriverProfileRow[]) {
 }
 
 export async function listDrivers(options?: {
+  availabilityStatusIds?: number[];
   approvedOnly?: boolean;
+  driverProfileIds?: string[];
   onlineOnly?: boolean;
+  staleLocationMinutes?: number;
+  withLocationOnly?: boolean;
   limit?: number;
 }) {
   let query = supabase
@@ -331,13 +659,165 @@ export async function listDrivers(options?: {
     query = query.eq("verification_status_id", STATUS.VERIFICATION_APPROVED);
   }
 
+  if (options?.driverProfileIds?.length) {
+    query = query.in("id", options.driverProfileIds);
+  }
+
   if (options?.onlineOnly) {
     query = query.eq("availability_status_id", STATUS.AVAILABILITY_ONLINE);
+  }
+
+  if (options?.availabilityStatusIds?.length) {
+    query = query.in("availability_status_id", options.availabilityStatusIds);
+  }
+
+  if (options?.withLocationOnly) {
+    const staleLocationMinutes =
+      options.staleLocationMinutes ?? DRIVER_LOCATION_STALE_MINUTES;
+    const minimumLocationTime = new Date(
+      Date.now() - staleLocationMinutes * 60 * 1000
+    ).toISOString();
+
+    query = query
+      .not("current_latitude", "is", null)
+      .not("current_longitude", "is", null)
+      .gte("last_location_at", minimumLocationTime);
   }
 
   const { data, error } = await query;
   formatError(error);
   return enrichDrivers((data ?? []) as DriverProfileRow[]);
+}
+
+function scoreRouteMatch(
+  driver: DriverSummary,
+  pickup: RoutePointInput,
+  destination: RoutePointInput,
+  passengerRouteCoordinates?: RouteCoordinateInput[]
+) {
+  if (typeof driver.currentLatitude !== "number" || typeof driver.currentLongitude !== "number") {
+    return null;
+  }
+
+  const distanceToPickupKm = distanceKm(
+    { latitude: driver.currentLatitude, longitude: driver.currentLongitude },
+    pickup
+  );
+
+  if (!driver.activeRoute) {
+    return distanceToPickupKm <= 5
+      ? {
+          distanceToPickupKm,
+          routeAlignmentScore: Math.max(30, 65 - distanceToPickupKm * 8),
+        }
+      : null;
+  }
+
+  const driverRoute = decodeDriverRoute(driver.activeRoute);
+  const passengerRoute =
+    passengerRouteCoordinates && passengerRouteCoordinates.length >= 2
+      ? passengerRouteCoordinates
+      : [pickup, destination];
+  const pickupPosition = nearestRoutePosition(pickup, driverRoute);
+  const destinationPosition = nearestRoutePosition(destination, driverRoute);
+
+  if (!pickupPosition || !destinationPosition) {
+    return null;
+  }
+
+  const hasDetailedPassengerRoute = passengerRouteCoordinates && passengerRouteCoordinates.length >= 2;
+  const nearRouteRatio = hasDetailedPassengerRoute
+    ? routeNearnessRatio(passengerRoute, driverRoute)
+    : 1;
+  const passengerRouteLengthKm = Math.max(routeLengthKm(passengerRoute), distanceKm(pickup, destination));
+  const sharedDriverSegmentKm = destinationPosition.progressKm - pickupPosition.progressKm;
+  const routeLengthDifferenceRatio =
+    passengerRouteLengthKm > 0
+      ? Math.abs(sharedDriverSegmentKm - passengerRouteLengthKm) / passengerRouteLengthKm
+      : 0;
+
+  if (
+    distanceToPickupKm > 20 ||
+    pickupPosition.distanceKm > 2.5 ||
+    destinationPosition.distanceKm > 3.5 ||
+    sharedDriverSegmentKm <= 0.5 ||
+    (hasDetailedPassengerRoute && nearRouteRatio < 0.65) ||
+    (hasDetailedPassengerRoute && routeLengthDifferenceRatio > 0.55)
+  ) {
+    return null;
+  }
+
+  if (!hasDetailedPassengerRoute) {
+    const driverBearing = bearingDegrees(driverRoute[0], driverRoute[driverRoute.length - 1]);
+    const passengerBearing = bearingDegrees(pickup, destination);
+    const directionDifference = bearingDifferenceDegrees(driverBearing, passengerBearing);
+
+    if (directionDifference > 55) {
+      return null;
+    }
+  }
+
+  const score = Math.max(
+    0,
+    Math.min(
+      100,
+      100 -
+        distanceToPickupKm * 3 -
+        pickupPosition.distanceKm * 10 -
+        destinationPosition.distanceKm * 12 -
+        (1 - nearRouteRatio) * 35 -
+        routeLengthDifferenceRatio * 20
+    )
+  );
+
+  return {
+    distanceToPickupKm,
+    routeAlignmentScore: Math.round(score * 100) / 100,
+  };
+}
+
+export async function listRouteMatchedDrivers(input: {
+  destination: RoutePointInput;
+  limit?: number;
+  pickup: RoutePointInput;
+  routeCoordinates?: RouteCoordinateInput[];
+}) {
+  const drivers = await listDrivers({
+    availabilityStatusIds: [STATUS.AVAILABILITY_ONLINE, STATUS.AVAILABILITY_BUSY],
+    approvedOnly: true,
+    staleLocationMinutes: DRIVER_LOCATION_STALE_MINUTES,
+    withLocationOnly: true,
+    limit: 100,
+  });
+  const matchedDrivers: DriverSummary[] = [];
+
+  for (const driver of drivers) {
+    const match = scoreRouteMatch(
+      driver,
+      input.pickup,
+      input.destination,
+      input.routeCoordinates
+    );
+
+    if (match) {
+      matchedDrivers.push({
+        ...driver,
+        ...match,
+      });
+    }
+  }
+
+  return matchedDrivers
+    .sort((a, b) => {
+      const scoreDelta = (b.routeAlignmentScore ?? 0) - (a.routeAlignmentScore ?? 0);
+
+      if (scoreDelta !== 0) {
+        return scoreDelta;
+      }
+
+      return (a.distanceToPickupKm ?? 0) - (b.distanceToPickupKm ?? 0);
+    })
+    .slice(0, input.limit ?? 12);
 }
 
 export async function getDriverForProfile(profileId: string) {
@@ -355,6 +835,33 @@ export async function getDriverForProfile(profileId: string) {
 
   const [driver] = await enrichDrivers([data as DriverProfileRow]);
   return driver ?? null;
+}
+
+async function getDriverVerification(driverProfileId: string) {
+  const { data, error } = await supabase
+    .from("driver_verifications")
+    .select("*")
+    .eq("driver_profile_id", driverProfileId)
+    .order("submitted_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  formatError(error);
+
+  if (!data) {
+    return null;
+  }
+
+  const row = data as DriverVerificationRow;
+
+  return {
+    id: row.id,
+    documentUrl: row.document_url,
+    rejectionReason: row.rejection_reason,
+    reviewedAt: row.reviewed_at,
+    statusId: row.verification_status_id,
+    submittedAt: row.submitted_at,
+  };
 }
 
 async function enrichRequests(rows: TransportRequestRow[]) {
@@ -379,6 +886,7 @@ async function enrichRequests(rows: TransportRequestRow[]) {
       passengerName: passenger?.full_name ?? "Passenger",
       driverName: driver?.name ?? "Matching driver",
       vehicleLabel: driver?.vehicleLabel ?? "Vehicle pending",
+      vehicleTypeId: driver?.vehicleTypeId ?? null,
       plateNumber: driver?.plateNumber ?? null,
       pickupName: row.pickup_name ?? "Pickup point",
       destinationName: row.destination_name ?? "Destination",
@@ -389,6 +897,9 @@ async function enrichRequests(rows: TransportRequestRow[]) {
       requestStatusId: row.request_status_id,
       passengerNote: row.passenger_note,
       requestedAt: row.requested_at,
+      driverCurrentLatitude: driver?.currentLatitude ?? null,
+      driverCurrentLongitude: driver?.currentLongitude ?? null,
+      driverProfileUserId: driver?.profileId ?? null,
     };
   });
 }
@@ -434,6 +945,9 @@ async function enrichReports(rows: ReportRow[]) {
     reportedUserName: row.reported_user_id
       ? profileMap.get(row.reported_user_id)?.full_name ?? "Reported user"
       : null,
+    transportRequestId: row.transport_request_id,
+    resolutionNote: row.resolution_note,
+    resolvedAt: row.resolved_at,
     createdAt: row.created_at,
   }));
 }
@@ -461,11 +975,67 @@ export async function listAdminReports() {
   return enrichReports((data ?? []) as ReportRow[]);
 }
 
+export async function listExternalSafetyReports() {
+  const { data, error } = await supabase
+    .from("external_trip_reports")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .limit(50);
+
+  formatError(error);
+
+  const rows = (data ?? []) as ExternalTripReportRow[];
+  const requestIds = Array.from(new Set(rows.map((row) => row.transport_request_id)));
+  const requestMap = new Map<string, TransportRequestSummary>();
+
+  if (requestIds.length > 0) {
+    const { data: requestRows, error: requestError } = await supabase
+      .from("transport_requests")
+      .select("*")
+      .in("id", requestIds);
+
+    formatError(requestError);
+
+    const requests = await enrichRequests((requestRows ?? []) as TransportRequestRow[]);
+
+    for (const request of requests) {
+      requestMap.set(request.id, request);
+    }
+  }
+
+  return rows.map<ExternalSafetyReportSummary>((row) => {
+    const request = requestMap.get(row.transport_request_id);
+
+    return {
+      id: row.id,
+      tripShareLinkId: row.trip_share_link_id,
+      transportRequestId: row.transport_request_id,
+      reporterName: row.reporter_name,
+      reporterPhone: row.reporter_phone,
+      reporterRelationship: row.reporter_relationship,
+      concernType: row.concern_type,
+      description: row.description,
+      reportStatusId: row.report_status_id,
+      pickupName: request?.pickupName ?? "Pickup point",
+      destinationName: request?.destinationName ?? "Destination",
+      passengerName: request?.passengerName ?? "Passenger",
+      driverName: request?.driverName ?? "Assigned driver",
+      vehicleLabel: request?.vehicleLabel ?? "Vehicle pending",
+      plateNumber: request?.plateNumber ?? null,
+      resolvedAt: row.resolved_at,
+      resolutionNote: row.resolution_note,
+      createdAt: row.created_at,
+    };
+  });
+}
+
 export async function getPassengerDashboard(profileId: string): Promise<PassengerDashboardData> {
   const [availableDrivers, requests, reports] = await Promise.all([
     listDrivers({
+      availabilityStatusIds: [STATUS.AVAILABILITY_ONLINE, STATUS.AVAILABILITY_BUSY],
       approvedOnly: true,
-      onlineOnly: true,
+      staleLocationMinutes: DRIVER_LOCATION_STALE_MINUTES,
+      withLocationOnly: true,
       limit: 20,
     }),
     listPassengerRequests(profileId),
@@ -477,12 +1047,13 @@ export async function getPassengerDashboard(profileId: string): Promise<Passenge
 
 export async function getDriverDashboard(profileId: string): Promise<DriverDashboardData> {
   const driver = await getDriverForProfile(profileId);
-  const [requests, reports] = await Promise.all([
+  const [requests, reports, verification] = await Promise.all([
     driver ? listDriverRequests(driver.id) : Promise.resolve([]),
     listReportsForUser(profileId),
+    driver ? getDriverVerification(driver.id) : Promise.resolve(null),
   ]);
 
-  return { driver, requests, reports };
+  return { driver, requests, reports, verification };
 }
 
 export async function getAdminDashboard(): Promise<AdminDashboardData> {
@@ -491,9 +1062,11 @@ export async function getAdminDashboard(): Promise<AdminDashboardData> {
     activeDrivers,
     pendingDrivers,
     pendingReports,
+    pendingExternalReports,
     usersResponse,
     drivers,
     reports,
+    externalSafetyReports,
   ] = await Promise.all([
     countRows("profiles"),
     countRows("driver_profiles", (query) =>
@@ -505,6 +1078,9 @@ export async function getAdminDashboard(): Promise<AdminDashboardData> {
     countRows("reports", (query) =>
       query.in("report_status_id", [STATUS.REPORT_PENDING, STATUS.REPORT_IN_REVIEW])
     ),
+    countRows("external_trip_reports", (query) =>
+      query.in("report_status_id", [STATUS.REPORT_PENDING, STATUS.REPORT_IN_REVIEW])
+    ),
     supabase
       .from("profiles")
       .select("*")
@@ -512,6 +1088,7 @@ export async function getAdminDashboard(): Promise<AdminDashboardData> {
       .limit(50),
     listDrivers({ limit: 50 }),
     listAdminReports(),
+    listExternalSafetyReports(),
   ]);
 
   formatError(usersResponse.error);
@@ -520,31 +1097,69 @@ export async function getAdminDashboard(): Promise<AdminDashboardData> {
     totalUsers,
     activeDrivers,
     pendingDrivers,
-    pendingReports,
+    pendingReports: pendingReports + pendingExternalReports,
     users: (usersResponse.data ?? []) as Profile[],
     drivers,
     reports,
+    externalSafetyReports,
   };
 }
 
 export async function createTransportRequest(input: {
-  passengerId: string;
+  destination: RoutePointInput;
   driverProfileId: string;
-  pickupName: string;
-  destinationName: string;
+  passengerId: string;
   passengerNote?: string;
+  pickup: RoutePointInput;
+  routeCoordinates?: RouteCoordinateInput[];
 }) {
+  const [selectedDriver] = await listDrivers({
+    driverProfileIds: [input.driverProfileId],
+    staleLocationMinutes: DRIVER_LOCATION_STALE_MINUTES,
+    withLocationOnly: true,
+    limit: 1,
+  });
+
+  if (!selectedDriver) {
+    throw new Error("This driver is no longer available. Choose another nearby driver.");
+  }
+
+  if (selectedDriver.verificationStatusId !== STATUS.VERIFICATION_APPROVED) {
+    throw new Error("This driver is not approved for requests yet.");
+  }
+
+  if (selectedDriver.availabilityStatusId === STATUS.AVAILABILITY_BUSY) {
+    throw new Error("This driver is currently busy. Choose another nearby driver.");
+  }
+
+  if (selectedDriver.availabilityStatusId !== STATUS.AVAILABILITY_ONLINE) {
+    throw new Error("This driver is offline right now. Choose another nearby driver.");
+  }
+
+  const match = scoreRouteMatch(
+    selectedDriver,
+    input.pickup,
+    input.destination,
+    input.routeCoordinates
+  );
+
+  if (!match) {
+    throw new Error(
+      "This driver is no longer a good route match for the selected trip. Choose another nearby driver."
+    );
+  }
+
   const { data, error } = await supabase
     .from("transport_requests")
     .insert({
       passenger_id: input.passengerId,
       driver_profile_id: input.driverProfileId,
-      pickup_name: input.pickupName,
-      destination_name: input.destinationName,
-      pickup_latitude: PLACES.pickup.latitude,
-      pickup_longitude: PLACES.pickup.longitude,
-      destination_latitude: PLACES.destination.latitude,
-      destination_longitude: PLACES.destination.longitude,
+      pickup_name: input.pickup.name,
+      destination_name: input.destination.name,
+      pickup_latitude: input.pickup.latitude,
+      pickup_longitude: input.pickup.longitude,
+      destination_latitude: input.destination.latitude,
+      destination_longitude: input.destination.longitude,
       request_status_id: STATUS.REQUEST_PENDING,
       passenger_note: input.passengerNote?.trim() || null,
     })
@@ -552,6 +1167,20 @@ export async function createTransportRequest(input: {
     .single();
 
   formatError(error);
+
+  if (selectedDriver) {
+    const { error: matchError } = await supabase.from("route_matches").insert({
+      request_id: data.id,
+      driver_profile_id: input.driverProfileId,
+      driver_route_id: selectedDriver.activeRoute?.id ?? null,
+      distance_to_pickup_m:
+        typeof match?.distanceToPickupKm === "number" ? match.distanceToPickupKm * 1000 : null,
+      route_alignment_score: match?.routeAlignmentScore ?? null,
+      is_selected: true,
+    });
+
+    formatError(matchError);
+  }
 
   const { data: driverProfile } = await supabase
     .from("driver_profiles")
@@ -564,7 +1193,7 @@ export async function createTransportRequest(input: {
       recipient_id: driverProfile.profile_id,
       notification_type_id: 1000,
       title: "New ride request",
-      body: `${input.pickupName} to ${input.destinationName}`,
+      body: `${input.pickup.name} to ${input.destination.name}`,
       related_request_id: data.id,
     });
   }
@@ -603,6 +1232,89 @@ export async function updateTransportRequestStatus(
     .eq("id", requestId);
 
   formatError(error);
+
+  if (
+    statusId === STATUS.REQUEST_ACCEPTED ||
+    statusId === STATUS.REQUEST_COMPLETED ||
+    statusId === STATUS.REQUEST_CANCELLED ||
+    statusId === STATUS.REQUEST_REJECTED
+  ) {
+    const { data: requestDriver } = await supabase
+      .from("transport_requests")
+      .select("driver_profile_id")
+      .eq("id", requestId)
+      .maybeSingle();
+
+    if (requestDriver?.driver_profile_id) {
+      await supabase
+        .from("driver_profiles")
+        .update({
+          availability_status_id:
+            statusId === STATUS.REQUEST_ACCEPTED
+              ? STATUS.AVAILABILITY_BUSY
+              : STATUS.AVAILABILITY_ONLINE,
+        })
+        .eq("id", requestDriver.driver_profile_id);
+    }
+  }
+
+  if (statusId === STATUS.REQUEST_ACCEPTED || statusId === STATUS.REQUEST_REJECTED) {
+    const { data: request } = await supabase
+      .from("transport_requests")
+      .select("passenger_id,pickup_name,destination_name")
+      .eq("id", requestId)
+      .maybeSingle();
+
+    if (request?.passenger_id) {
+      await supabase.from("notifications").insert({
+        recipient_id: request.passenger_id,
+        notification_type_id:
+          statusId === STATUS.REQUEST_ACCEPTED ? 2000 : 3000,
+        title:
+          statusId === STATUS.REQUEST_ACCEPTED
+            ? "Request accepted"
+            : "Request rejected",
+        body: `${request.pickup_name ?? "Pickup"} to ${
+          request.destination_name ?? "destination"
+        }`,
+        related_request_id: requestId,
+      });
+    }
+  }
+}
+
+export async function createTripSafetyShareLink(input: {
+  expiresInHours?: number;
+  requestId: string;
+}) {
+  const { data, error } = await supabase.rpc("create_trip_share_link", {
+    p_request_id: input.requestId,
+    p_expires_in_hours: input.expiresInHours ?? 72,
+  });
+
+  formatError(error);
+
+  const row = Array.isArray(data) ? data[0] : data;
+
+  if (!row?.token || !row?.id || !row?.expires_at) {
+    throw new Error("The trip safety link could not be created.");
+  }
+
+  return {
+    id: row.id as string,
+    token: row.token as string,
+    expiresAt: row.expires_at as string,
+    shareUrl: buildTripShareUrl(row.token as string),
+  } satisfies TripSafetyShareLink;
+}
+
+export async function revokeTripSafetyShareLinks(requestId: string) {
+  const { data, error } = await supabase.rpc("revoke_trip_share_links", {
+    p_request_id: requestId,
+  });
+
+  formatError(error);
+  return typeof data === "number" ? data : 0;
 }
 
 export async function updateDriverAvailability(input: {
@@ -629,22 +1341,52 @@ export async function updateDriverAvailability(input: {
   formatError(error);
 }
 
+export async function recordDriverLocationUpdate(input: {
+  driverProfileId: string;
+  heading?: number | null;
+  latitude: number;
+  longitude: number;
+  speed?: number | null;
+  transportRequestId?: string | null;
+}) {
+  const now = new Date().toISOString();
+
+  const { error: profileError } = await supabase
+    .from("driver_profiles")
+    .update({
+      current_latitude: input.latitude,
+      current_longitude: input.longitude,
+      last_location_at: now,
+    })
+    .eq("id", input.driverProfileId);
+
+  formatError(profileError);
+
+  const { error } = await supabase.from("location_updates").insert({
+    driver_profile_id: input.driverProfileId,
+    transport_request_id: input.transportRequestId ?? null,
+    latitude: input.latitude,
+    longitude: input.longitude,
+    speed: input.speed ?? null,
+    heading: input.heading ?? null,
+    recorded_at: now,
+  });
+
+  formatError(error);
+}
+
 export async function updateProfile(input: {
   profileId: string;
   fullName: string;
   phone?: string | null;
   city?: string | null;
 }) {
-  const { data, error } = await supabase
-    .from("profiles")
-    .update({
-      full_name: input.fullName.trim(),
-      phone: input.phone?.trim() || null,
-      city: input.city?.trim() || null,
-    })
-    .eq("id", input.profileId)
-    .select("*")
-    .single();
+  const { data, error } = await supabase.rpc("update_own_profile", {
+    p_city: input.city?.trim() || null,
+    p_full_name: input.fullName.trim(),
+    p_phone: input.phone?.trim() || null,
+    p_profile_id: input.profileId,
+  });
 
   formatError(error);
   return data as Profile;
@@ -684,7 +1426,8 @@ export async function updateDriverVehicle(input: {
 
 export async function updateUserAccountStatus(
   profileId: string,
-  accountStatusId: number
+  accountStatusId: number,
+  adminId?: string | null
 ) {
   const { data, error } = await supabase
     .from("profiles")
@@ -696,13 +1439,22 @@ export async function updateUserAccountStatus(
     .single();
 
   formatError(error);
+  await recordAdminAuditLog({
+    action: "user_account_status_updated",
+    adminId,
+    entityId: profileId,
+    entityTable: "profiles",
+    metadata: { accountStatusId },
+  });
+
   return data as Profile;
 }
 
 export async function saveDriverRoute(input: {
+  destination: RoutePointInput;
   driverProfileId: string;
-  startName: string;
-  destinationName: string;
+  routePolyline?: string | null;
+  start: RoutePointInput;
 }) {
   await supabase
     .from("driver_routes")
@@ -717,12 +1469,13 @@ export async function saveDriverRoute(input: {
     .from("driver_routes")
     .insert({
       driver_profile_id: input.driverProfileId,
-      start_name: input.startName.trim(),
-      destination_name: input.destinationName.trim(),
-      start_latitude: PLACES.pickup.latitude,
-      start_longitude: PLACES.pickup.longitude,
-      destination_latitude: PLACES.destination.latitude,
-      destination_longitude: PLACES.destination.longitude,
+      start_name: input.start.name.trim(),
+      destination_name: input.destination.name.trim(),
+      start_latitude: input.start.latitude,
+      start_longitude: input.start.longitude,
+      destination_latitude: input.destination.latitude,
+      destination_longitude: input.destination.longitude,
+      route_polyline: input.routePolyline ?? null,
       route_status_id: STATUS.ROUTE_ACTIVE,
     })
     .select("*")
@@ -735,7 +1488,8 @@ export async function saveDriverRoute(input: {
 export async function updateDriverVerification(
   driverProfileId: string,
   verificationStatusId: number,
-  note?: string
+  note?: string,
+  adminId?: string | null
 ) {
   const { error } = await supabase
     .from("driver_profiles")
@@ -758,9 +1512,76 @@ export async function updateDriverVerification(
         verificationStatusId === STATUS.VERIFICATION_REJECTED
           ? note?.trim() || "Verification rejected by admin."
           : null,
+      reviewed_by: adminId ?? null,
       reviewed_at: new Date().toISOString(),
     })
     .eq("driver_profile_id", driverProfileId);
+
+  await recordAdminAuditLog({
+    action: "driver_verification_updated",
+    adminId,
+    entityId: driverProfileId,
+    entityTable: "driver_profiles",
+    metadata: {
+      note: note?.trim() || null,
+      verificationStatusId,
+    },
+  });
+}
+
+export async function submitDriverVerification(input: {
+  documentUrl: string;
+  driverProfileId: string;
+}) {
+  const cleanDocumentUrl = input.documentUrl.trim();
+
+  if (!cleanDocumentUrl) {
+    throw new Error("Add a Supabase Storage document URL before submitting verification.");
+  }
+
+  if (!isDriverVerificationStorageUrl(cleanDocumentUrl)) {
+    throw new Error(
+      `Upload the document to Supabase Storage bucket "${DRIVER_VERIFICATION_STORAGE_BUCKET}" and submit the generated storage URL.`
+    );
+  }
+
+  const { data: existing, error: lookupError } = await supabase
+    .from("driver_verifications")
+    .select("id")
+    .eq("driver_profile_id", input.driverProfileId)
+    .limit(1);
+
+  formatError(lookupError);
+
+  const payload = {
+    document_url: cleanDocumentUrl,
+    verification_status_id: STATUS.VERIFICATION_PENDING,
+    rejection_reason: null,
+    reviewed_at: null,
+    submitted_at: new Date().toISOString(),
+  };
+  const query = existing?.[0]?.id
+    ? supabase
+        .from("driver_verifications")
+        .update(payload)
+        .eq("id", existing[0].id)
+    : supabase.from("driver_verifications").insert({
+        ...payload,
+        driver_profile_id: input.driverProfileId,
+      });
+
+  const { error } = await query;
+  formatError(error);
+
+  const { error: driverError } = await supabase
+    .from("driver_profiles")
+    .update({
+      verification_status_id: STATUS.VERIFICATION_PENDING,
+      availability_status_id: STATUS.AVAILABILITY_OFFLINE,
+    })
+    .eq("id", input.driverProfileId);
+
+  formatError(driverError);
 }
 
 export async function createReport(input: {
@@ -771,6 +1592,38 @@ export async function createReport(input: {
   transportRequestId?: string;
   reportedUserId?: string;
 }) {
+  const title = input.title.trim();
+  const description = input.description.trim();
+
+  if (title.length < 3 || description.length < 10) {
+    throw new Error("Add a clear title and at least 10 characters before submitting a report.");
+  }
+
+  const recentWindowStart = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  const { data: recentReports, error: recentReportsError } = await supabase
+    .from("reports")
+    .select("id,title,description,created_at")
+    .eq("reporter_id", input.reporterId)
+    .gte("created_at", recentWindowStart)
+    .order("created_at", { ascending: false })
+    .limit(10);
+
+  formatError(recentReportsError);
+
+  if ((recentReports ?? []).length >= 3) {
+    throw new Error("Please wait before submitting another report. Recent reports are being reviewed.");
+  }
+
+  const duplicateReport = (recentReports ?? []).some(
+    (report) =>
+      normalizeReportText(report.title) === normalizeReportText(title) &&
+      normalizeReportText(report.description) === normalizeReportText(description)
+  );
+
+  if (duplicateReport) {
+    throw new Error("A similar report was already submitted recently.");
+  }
+
   const { data, error } = await supabase
     .from("reports")
     .insert({
@@ -779,8 +1632,8 @@ export async function createReport(input: {
       transport_request_id: input.transportRequestId ?? null,
       report_type_id: input.reportTypeId ?? 4000,
       report_status_id: STATUS.REPORT_PENDING,
-      title: input.title.trim(),
-      description: input.description.trim(),
+      title,
+      description,
     })
     .select("*")
     .single();
@@ -806,4 +1659,43 @@ export async function updateReportStatus(
     .eq("id", reportId);
 
   formatError(error);
+  await recordAdminAuditLog({
+    action: "report_status_updated",
+    adminId,
+    entityId: reportId,
+    entityTable: "reports",
+    metadata: {
+      note: note?.trim() || null,
+      statusId,
+    },
+  });
+}
+
+export async function updateExternalSafetyReportStatus(
+  reportId: string,
+  statusId: number,
+  adminId: string,
+  note?: string
+) {
+  const { error } = await supabase
+    .from("external_trip_reports")
+    .update({
+      report_status_id: statusId,
+      resolved_by: adminId,
+      resolved_at: new Date().toISOString(),
+      resolution_note: note?.trim() || null,
+    })
+    .eq("id", reportId);
+
+  formatError(error);
+  await recordAdminAuditLog({
+    action: "external_trip_report_status_updated",
+    adminId,
+    entityId: reportId,
+    entityTable: "external_trip_reports",
+    metadata: {
+      note: note?.trim() || null,
+      statusId,
+    },
+  });
 }
