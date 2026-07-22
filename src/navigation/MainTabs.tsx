@@ -4,11 +4,13 @@ import {
   Alert,
   Modal,
   ScrollView,
+  StyleSheet,
   Text,
   TouchableOpacity,
   useWindowDimensions,
   View,
 } from "react-native";
+import { BlurView } from "expo-blur";
 import { createBottomTabNavigator, type BottomTabBarProps } from "@react-navigation/bottom-tabs";
 import {
   Car,
@@ -284,7 +286,9 @@ function IncomingDriverRequestsModal({ profileId }: { profileId: string }) {
 
   return (
     <Modal visible transparent animationType="fade" statusBarTranslucent>
-      <View className="flex-1 items-center justify-center bg-black/45 px-5">
+      <View className="flex-1 items-center justify-center px-5">
+        <BlurView intensity={36} tint="dark" style={StyleSheet.absoluteFill} />
+        <View className="absolute inset-0 bg-black/35" />
         <View
           className="overflow-hidden rounded-2xl border border-divider bg-surface"
           style={{ width: cardWidth }}
