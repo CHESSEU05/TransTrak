@@ -2,6 +2,7 @@ const requiredEasEnv = [
   "EXPO_PUBLIC_SUPABASE_URL",
   "EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
   "EXPO_PUBLIC_GOOGLE_MAPS_API_KEY",
+  "EXPO_PUBLIC_TRIP_SHARE_BASE_URL",
 ];
 
 module.exports = ({ config }) => {

@@ -4,8 +4,10 @@ import {
   ActivityIndicator,
   Alert,
   KeyboardAvoidingView,
+  Linking,
   Platform,
   RefreshControl,
+  Share,
   ScrollView,
   Text,
   TextInput,
@@ -21,6 +23,7 @@ import {
   ClipboardList,
   Clock3,
   Edit3,
+  ExternalLink,
   FileText,
   FileUp,
   HelpCircle,
@@ -49,6 +52,7 @@ import { colors } from "../../constants/colors";
 import { useAuth } from "../../context/AuthContext";
 import {
   createReport,
+  createTripSafetyShareLink,
   createTransportRequest,
   DRIVER_LOCATION_STALE_MINUTES,
   DRIVER_VERIFICATION_STORAGE_BUCKET,
@@ -64,14 +68,17 @@ import {
   updateDriverAvailability,
   updateDriverVerification,
   updateDriverVehicle,
+  updateExternalSafetyReportStatus,
   updateProfile,
   updateUserAccountStatus,
   updateReportStatus,
   updateTransportRequestStatus,
+  revokeTripSafetyShareLinks,
 } from "../../services/app/appService";
 import type {
   DriverSummary,
   DriverVerificationSummary,
+  ExternalSafetyReportSummary,
   RoutePointInput,
   ReportSummary,
   TransportRequestSummary,
@@ -95,6 +102,24 @@ type ResourceState<T> = {
   isLoading: boolean;
   isRefreshing: boolean;
 };
+
+const TRANSTRAK_WEBSITE_BASE_URL =
+  process.env.EXPO_PUBLIC_TRANSTRAK_WEBSITE_URL?.trim().replace(/\/+$/, "") ||
+  "https://transtrak-website.njipditertullien.chatgpt.site";
+
+function transtrakWebsiteUrl(anchor: string) {
+  return `${TRANSTRAK_WEBSITE_BASE_URL}${anchor}`;
+}
+
+async function openWebsiteSection(anchor: string, title: string) {
+  const url = transtrakWebsiteUrl(anchor);
+
+  try {
+    await Linking.openURL(url);
+  } catch {
+    Alert.alert("Could not open link", `Please visit ${url} to read the full ${title}.`);
+  }
+}
 
 function useAsyncResource<T>(
   loader: () => Promise<T>,
@@ -194,6 +219,33 @@ function formatShortDate(value?: string | null) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value));
+}
+
+async function shareTripSafetyLink(request: TransportRequestSummary) {
+  const link = await createTripSafetyShareLink({
+    requestId: request.id,
+    expiresInHours: 72,
+  });
+  const plateText = request.plateNumber ? `\nPlate: ${request.plateNumber}` : "";
+  const message = [
+    "I am sharing my TransTrak trip for safety.",
+    "",
+    `Pickup: ${request.pickupName}`,
+    `Destination: ${request.destinationName}`,
+    `Driver: ${request.driverName}`,
+    `Vehicle: ${request.vehicleLabel}${plateText}`,
+    "",
+    `Track this trip and report concerns here: ${link.shareUrl}`,
+    `This safety link expires on ${formatShortDate(link.expiresAt)}.`,
+  ].join("\n");
+
+  await Share.share({
+    title: "TransTrak trip safety link",
+    message,
+    url: link.shareUrl,
+  });
+
+  return link;
 }
 
 function getRequestStatus(statusId: number) {
@@ -888,7 +940,7 @@ function PrimaryButton({
       activeOpacity={0.85}
       disabled={disabled || loading}
       onPress={onPress}
-      className={`h-12 flex-1 items-center justify-center rounded-xl ${
+      className={`h-12 min-w-32 flex-1 items-center justify-center rounded-xl ${
         disabled || loading ? "opacity-50" : ""
       }`}
       style={{
@@ -1167,7 +1219,9 @@ function RequestCard({
   onCancel,
   onComplete,
   onReject,
+  onRevokeSafetyLinks,
   onShareLocation,
+  onShareSafetyLink,
   request,
 }: {
   canRespond?: boolean;
@@ -1176,7 +1230,9 @@ function RequestCard({
   onCancel?: () => void;
   onComplete?: () => void;
   onReject?: () => void;
+  onRevokeSafetyLinks?: () => void;
   onShareLocation?: () => void;
+  onShareSafetyLink?: () => void;
   request: TransportRequestSummary;
 }) {
   const status = getRequestStatus(request.requestStatusId);
@@ -1232,7 +1288,7 @@ function RequestCard({
           <RequestRouteMap request={request} drivers={mapDriver ? [mapDriver] : []} />
         </View>
       ) : null}
-      <View className="mt-4 flex-row gap-3">
+      <View className="mt-4 flex-row flex-wrap gap-3">
         {onAccept ? (
           <PrimaryButton
             disabled={!canRespond}
@@ -1271,6 +1327,22 @@ function RequestCard({
             loading={isUpdating}
             onPress={onShareLocation}
             tone="outline"
+          />
+        ) : null}
+        {onShareSafetyLink ? (
+          <PrimaryButton
+            label="Share trip"
+            loading={isUpdating}
+            onPress={onShareSafetyLink}
+            tone="outline"
+          />
+        ) : null}
+        {onRevokeSafetyLinks ? (
+          <PrimaryButton
+            label="Stop link"
+            loading={isUpdating}
+            onPress={onRevokeSafetyLinks}
+            tone="warning"
           />
         ) : null}
       </View>
@@ -1381,6 +1453,62 @@ function VerificationBanner({ driver }: { driver: DriverSummary | null }) {
           ? "You can go online, share routes, and respond to passenger requests."
           : "You can view your dashboard, edit profile details, and submit reports. Going online and accepting requests unlock after admin approval."}
       </Text>
+    </View>
+  );
+}
+
+function ExternalSafetyReportCard({
+  onDismiss,
+  onResolve,
+  report,
+}: {
+  onDismiss?: () => void;
+  onResolve?: () => void;
+  report: ExternalSafetyReportSummary;
+}) {
+  const status = getReportStatus(report.reportStatusId);
+
+  return (
+    <View className="rounded-2xl border border-danger bg-danger/10 p-4">
+      <View className="flex-row items-start justify-between">
+        <View className="flex-1 pr-3">
+          <Text className="font-jakarta-bold text-base text-text">{report.concernType}</Text>
+          <Text className="mt-1 font-jakarta text-sm text-textSecondary">
+            Trusted contact: {report.reporterName}
+            {report.reporterRelationship ? ` (${report.reporterRelationship})` : ""}
+          </Text>
+          <Text className="mt-1 font-jakarta text-xs text-textSecondary">
+            Phone: {report.reporterPhone} - {formatShortDate(report.createdAt)}
+          </Text>
+        </View>
+        <StatusBadge {...status} />
+      </View>
+      <View className="mt-3 rounded-xl bg-surface p-3">
+        <Text className="font-jakarta-bold text-sm text-text">
+          {report.pickupName} to {report.destinationName}
+        </Text>
+        <Text className="mt-1 font-jakarta text-xs text-textSecondary">
+          Passenger: {report.passengerName}
+        </Text>
+        <Text className="mt-1 font-jakarta text-xs text-textSecondary">
+          Driver: {report.driverName} - {report.vehicleLabel}
+          {report.plateNumber ? ` - ${report.plateNumber}` : ""}
+        </Text>
+      </View>
+      <Text className="mt-3 font-jakarta text-sm text-text">{report.description}</Text>
+      {report.resolutionNote ? (
+        <InlineNotice message={report.resolutionNote} tone="success" />
+      ) : null}
+      {onResolve || onDismiss ? (
+        <View className="mt-4 flex-row gap-3">
+          {onResolve ? (
+            <PrimaryButton label="Resolve" onPress={onResolve} />
+          ) : null}
+          {onDismiss ? (
+            <PrimaryButton label="Dismiss" onPress={onDismiss} tone="outline" />
+          ) : null}
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -1660,6 +1788,7 @@ export function PassengerHomeScreen() {
     () => getPassengerDashboard(profile?.id ?? ""),
     [profile?.id]
   );
+  const [sharingRequestId, setSharingRequestId] = useState<string | null>(null);
 
   const data = resource.data;
   const activeRequest = data?.requests.find((request) =>
@@ -1674,6 +1803,18 @@ export function PassengerHomeScreen() {
     ],
     resource.refresh
   );
+
+  async function handleShareSafetyLink(request: TransportRequestSummary) {
+    setSharingRequestId(request.id);
+
+    try {
+      await shareTripSafetyLink(request);
+    } catch (error) {
+      Alert.alert("Trip sharing failed", friendlyAppError(error));
+    } finally {
+      setSharingRequestId(null);
+    }
+  }
 
   return (
     <ScreenShell
@@ -1720,7 +1861,15 @@ export function PassengerHomeScreen() {
           />
           <MapLegend />
           {activeRequest ? (
-            <RequestCard request={activeRequest} />
+            <RequestCard
+              request={activeRequest}
+              isUpdating={sharingRequestId === activeRequest.id}
+              onShareSafetyLink={
+                activeRequest.requestStatusId === STATUS.REQUEST_ACCEPTED
+                  ? () => handleShareSafetyLink(activeRequest)
+                  : undefined
+              }
+            />
           ) : (
             <EmptyState
               icon={Search}
@@ -1987,6 +2136,36 @@ export function PassengerRequestsScreen() {
     }
   }
 
+  async function handleShareSafetyLink(request: TransportRequestSummary) {
+    setUpdatingId(request.id);
+
+    try {
+      await shareTripSafetyLink(request);
+    } catch (error) {
+      Alert.alert("Trip sharing failed", friendlyAppError(error));
+    } finally {
+      setUpdatingId(null);
+    }
+  }
+
+  async function handleRevokeSafetyLinks(requestId: string) {
+    setUpdatingId(requestId);
+
+    try {
+      const count = await revokeTripSafetyShareLinks(requestId);
+      Alert.alert(
+        "Safety links stopped",
+        count > 0
+          ? `${count} active safety link${count === 1 ? "" : "s"} revoked.`
+          : "There were no active safety links for this trip."
+      );
+    } catch (error) {
+      Alert.alert("Could not stop sharing", friendlyAppError(error));
+    } finally {
+      setUpdatingId(null);
+    }
+  }
+
   const requests = resource.data?.requests ?? [];
   useRealtimeRefresh(
     [
@@ -2024,6 +2203,16 @@ export function PassengerRequestsScreen() {
             onComplete={
               request.requestStatusId === STATUS.REQUEST_ACCEPTED
                 ? () => updateRequest(request.id, STATUS.REQUEST_COMPLETED)
+                : undefined
+            }
+            onShareSafetyLink={
+              request.requestStatusId === STATUS.REQUEST_ACCEPTED
+                ? () => handleShareSafetyLink(request)
+                : undefined
+            }
+            onRevokeSafetyLinks={
+              request.requestStatusId === STATUS.REQUEST_ACCEPTED
+                ? () => handleRevokeSafetyLinks(request.id)
                 : undefined
             }
           />
@@ -2678,6 +2867,14 @@ export function AdminDashboardScreen() {
           {data.reports.slice(0, 3).map((report) => (
             <ReportCard key={report.id} report={report} />
           ))}
+          {data.externalSafetyReports.length > 0 ? (
+            <>
+              <SectionTitle title="Trusted contact reports" />
+              {data.externalSafetyReports.slice(0, 3).map((report) => (
+                <ExternalSafetyReportCard key={report.id} report={report} />
+              ))}
+            </>
+          ) : null}
         </>
       ) : null}
     </ScreenShell>
@@ -2950,10 +3147,15 @@ export function AdminReportsScreen() {
   const { profile } = useAuth();
   const resource = useAsyncResource(getAdminDashboard, []);
   const reports = resource.data?.reports ?? [];
+  const externalSafetyReports = resource.data?.externalSafetyReports ?? [];
   const [updatingId, setUpdatingId] = useState<string | null>(null);
   const [resolutionNote, setResolutionNote] = useState("");
   useRealtimeRefresh(
-    ["admin:reports", ...reports.map((report) => `report:${report.id}`)],
+    [
+      "admin:reports",
+      ...reports.map((report) => `report:${report.id}`),
+      ...externalSafetyReports.map((report) => `external-report:${report.id}`),
+    ],
     resource.refresh
   );
 
@@ -2985,6 +3187,34 @@ export function AdminReportsScreen() {
     }
   }
 
+  async function handleExternalReport(reportId: string, statusId: number) {
+    if (!profile?.id) {
+      return;
+    }
+
+    const cleanNote = resolutionNote.trim();
+
+    if (cleanNote.length < 8) {
+      Alert.alert(
+        "Resolution note needed",
+        "Add a short admin note before resolving or dismissing this trusted-contact report."
+      );
+      return;
+    }
+
+    setUpdatingId(reportId);
+
+    try {
+      await updateExternalSafetyReportStatus(reportId, statusId, profile.id, cleanNote);
+      setResolutionNote("");
+      await resource.refresh();
+    } catch (error) {
+      Alert.alert("External report update failed", friendlyAppError(error));
+    } finally {
+      setUpdatingId(null);
+    }
+  }
+
   return (
     <ScreenShell
       title="Reports"
@@ -3009,28 +3239,51 @@ export function AdminReportsScreen() {
           textAlignVertical="top"
         />
       </View>
+      {externalSafetyReports.length > 0 ? (
+        <>
+          <SectionTitle title="Trusted contact reports" />
+          {externalSafetyReports.map((report) => (
+            <View key={report.id} className={updatingId === report.id ? "opacity-60" : ""}>
+              <ExternalSafetyReportCard
+                report={report}
+                onResolve={() => handleExternalReport(report.id, STATUS.REPORT_RESOLVED)}
+                onDismiss={() => handleExternalReport(report.id, STATUS.REPORT_DISMISSED)}
+              />
+            </View>
+          ))}
+        </>
+      ) : null}
       {reports.length > 0 ? (
-        reports.map((report) => (
-          <View key={report.id} className={updatingId === report.id ? "opacity-60" : ""}>
-            <ReportCard
-              report={report}
-              onResolve={() => handleReport(report.id, STATUS.REPORT_RESOLVED)}
-              onDismiss={() => handleReport(report.id, STATUS.REPORT_DISMISSED)}
-            />
-          </View>
-        ))
-      ) : (
+        <>
+          <SectionTitle title="In-app reports" />
+          {reports.map((report) => (
+            <View key={report.id} className={updatingId === report.id ? "opacity-60" : ""}>
+              <ReportCard
+                report={report}
+                onResolve={() => handleReport(report.id, STATUS.REPORT_RESOLVED)}
+                onDismiss={() => handleReport(report.id, STATUS.REPORT_DISMISSED)}
+              />
+            </View>
+          ))}
+        </>
+      ) : externalSafetyReports.length === 0 ? (
         <EmptyState
           icon={FileText}
           title="No reports pending"
           description="Submitted reports and safety issues will appear here."
         />
-      )}
+      ) : null}
     </ScreenShell>
   );
 }
 
-type ProfileSectionKey = "about" | "help" | "permissions" | "privacy" | "terms";
+type ProfileSectionKey =
+  | "about"
+  | "data"
+  | "help"
+  | "permissions"
+  | "privacy"
+  | "terms";
 
 type ProfileSectionConfig = {
   key: ProfileSectionKey;
@@ -3039,6 +3292,7 @@ type ProfileSectionConfig = {
   icon: LucideIcon;
   color: string;
   bg: string;
+  websiteAnchor: string;
 };
 
 const PROFILE_SECTIONS: ProfileSectionConfig[] = [
@@ -3049,6 +3303,7 @@ const PROFILE_SECTIONS: ProfileSectionConfig[] = [
     icon: HelpCircle,
     color: colors.info,
     bg: colors.infoSoft,
+    websiteAnchor: "#workflows",
   },
   {
     key: "privacy",
@@ -3057,6 +3312,7 @@ const PROFILE_SECTIONS: ProfileSectionConfig[] = [
     icon: LockKeyhole,
     color: colors.violet,
     bg: colors.violetSoft,
+    websiteAnchor: "#privacy",
   },
   {
     key: "terms",
@@ -3065,6 +3321,16 @@ const PROFILE_SECTIONS: ProfileSectionConfig[] = [
     icon: ScrollText,
     color: colors.primary,
     bg: colors.primarySoft,
+    websiteAnchor: "#terms",
+  },
+  {
+    key: "data",
+    title: "Data usage",
+    subtitle: "How location, route, request, and report data support the prototype.",
+    icon: RadioTower,
+    color: colors.bike,
+    bg: colors.successSoft,
+    websiteAnchor: "#data-usage",
   },
   {
     key: "permissions",
@@ -3073,6 +3339,7 @@ const PROFILE_SECTIONS: ProfileSectionConfig[] = [
     icon: SlidersHorizontal,
     color: colors.warning,
     bg: colors.warningSoft,
+    websiteAnchor: "#security",
   },
   {
     key: "about",
@@ -3081,6 +3348,7 @@ const PROFILE_SECTIONS: ProfileSectionConfig[] = [
     icon: Info,
     color: colors.success,
     bg: colors.successSoft,
+    websiteAnchor: "#overview",
   },
 ];
 
@@ -3125,9 +3393,14 @@ function ProfileSectionPanel({
 }) {
   const content: Record<ProfileSectionKey, string[]> = {
     about: [
-      "TransTrak supports route-aware matching between passengers and nearby local transport.",
-      "The prototype focuses on Cameroon transport patterns, driver verification, reports, and live location visibility.",
+      "TransTrak is an academic mobile prototype for local taxi and bike transport tracking in Cameroon.",
+      "The prototype focuses on transport visibility, passenger-driver coordination, driver availability, route entry, reports, and admin management.",
       `Current account role: ${role}.`,
+    ],
+    data: [
+      "TransTrak uses profile, location, route, request, and report data to support transport discovery and coordination.",
+      "ETA and distance information depend on GPS accuracy, internet connectivity, and configured map services.",
+      `Driver locations older than ${DRIVER_LOCATION_STALE_MINUTES} minutes are hidden instead of shown as live positions.`,
     ],
     help: [
       "Passengers can map pickup and destination, choose a route-matched driver, then track an accepted trip.",
@@ -3186,6 +3459,16 @@ function ProfileSectionPanel({
           </View>
         ))}
       </View>
+      <TouchableOpacity
+        activeOpacity={0.8}
+        onPress={() => openWebsiteSection(section.websiteAnchor, section.title)}
+        className="mt-4 flex-row items-center justify-center rounded-xl border border-primary bg-primarySoft px-4 py-3"
+      >
+        <ExternalLink color={colors.primary} size={17} />
+        <Text className="ml-2 font-jakarta-bold text-sm text-primary">
+          Read full details on website
+        </Text>
+      </TouchableOpacity>
     </View>
   );
 }

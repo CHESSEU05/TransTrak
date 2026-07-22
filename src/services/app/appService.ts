@@ -133,6 +133,23 @@ type DriverVerificationRow = {
   updated_at: string;
 };
 
+type ExternalTripReportRow = {
+  id: string;
+  trip_share_link_id: string;
+  transport_request_id: string;
+  reporter_name: string;
+  reporter_phone: string;
+  reporter_relationship: string | null;
+  concern_type: string;
+  description: string;
+  report_status_id: number;
+  resolved_by: string | null;
+  resolved_at: string | null;
+  resolution_note: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type DriverSummary = {
   id: string;
   profileId: string;
@@ -192,6 +209,34 @@ export type ReportSummary = {
   createdAt: string;
 };
 
+export type ExternalSafetyReportSummary = {
+  id: string;
+  tripShareLinkId: string;
+  transportRequestId: string;
+  reporterName: string;
+  reporterPhone: string;
+  reporterRelationship: string | null;
+  concernType: string;
+  description: string;
+  reportStatusId: number;
+  pickupName: string;
+  destinationName: string;
+  passengerName: string;
+  driverName: string;
+  vehicleLabel: string;
+  plateNumber: string | null;
+  resolvedAt: string | null;
+  resolutionNote: string | null;
+  createdAt: string;
+};
+
+export type TripSafetyShareLink = {
+  expiresAt: string;
+  id: string;
+  shareUrl: string;
+  token: string;
+};
+
 export type DriverVerificationSummary = {
   id: string;
   documentUrl: string | null;
@@ -222,6 +267,7 @@ export type AdminDashboardData = {
   users: Profile[];
   drivers: DriverSummary[];
   reports: ReportSummary[];
+  externalSafetyReports: ExternalSafetyReportSummary[];
 };
 
 function byId<T extends { id: string }>(rows: T[]) {
@@ -313,6 +359,43 @@ function isDriverVerificationStorageUrl(value: string) {
 
 function normalizeReportText(value: string) {
   return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function tripShareBaseUrl() {
+  return process.env.EXPO_PUBLIC_TRIP_SHARE_BASE_URL?.trim().replace(/\/+$/, "") ?? "";
+}
+
+function tripShareApiUrl() {
+  const configuredUrl = process.env.EXPO_PUBLIC_TRIP_SHARE_API_URL?.trim().replace(/\/+$/, "");
+
+  if (configuredUrl) {
+    return configuredUrl;
+  }
+
+  const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL?.trim();
+  const match = supabaseUrl?.match(/^https:\/\/([^.]+)\.supabase\.co\/?$/);
+
+  return match ? `https://${match[1]}.supabase.co/functions/v1/shared-trip` : "";
+}
+
+function buildTripShareUrl(token: string) {
+  const baseUrl = tripShareBaseUrl();
+  const apiUrl = tripShareApiUrl();
+
+  if (!baseUrl) {
+    throw new Error(
+      "Trip sharing is not configured yet. Add EXPO_PUBLIC_TRIP_SHARE_BASE_URL before sharing safety links."
+    );
+  }
+
+  const url = new URL(baseUrl);
+  url.searchParams.set("token", token);
+
+  if (apiUrl) {
+    url.searchParams.set("api", apiUrl);
+  }
+
+  return url.toString();
 }
 
 function distanceKm(a: { latitude: number; longitude: number }, b: { latitude: number; longitude: number }) {
@@ -892,6 +975,60 @@ export async function listAdminReports() {
   return enrichReports((data ?? []) as ReportRow[]);
 }
 
+export async function listExternalSafetyReports() {
+  const { data, error } = await supabase
+    .from("external_trip_reports")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .limit(50);
+
+  formatError(error);
+
+  const rows = (data ?? []) as ExternalTripReportRow[];
+  const requestIds = Array.from(new Set(rows.map((row) => row.transport_request_id)));
+  const requestMap = new Map<string, TransportRequestSummary>();
+
+  if (requestIds.length > 0) {
+    const { data: requestRows, error: requestError } = await supabase
+      .from("transport_requests")
+      .select("*")
+      .in("id", requestIds);
+
+    formatError(requestError);
+
+    const requests = await enrichRequests((requestRows ?? []) as TransportRequestRow[]);
+
+    for (const request of requests) {
+      requestMap.set(request.id, request);
+    }
+  }
+
+  return rows.map<ExternalSafetyReportSummary>((row) => {
+    const request = requestMap.get(row.transport_request_id);
+
+    return {
+      id: row.id,
+      tripShareLinkId: row.trip_share_link_id,
+      transportRequestId: row.transport_request_id,
+      reporterName: row.reporter_name,
+      reporterPhone: row.reporter_phone,
+      reporterRelationship: row.reporter_relationship,
+      concernType: row.concern_type,
+      description: row.description,
+      reportStatusId: row.report_status_id,
+      pickupName: request?.pickupName ?? "Pickup point",
+      destinationName: request?.destinationName ?? "Destination",
+      passengerName: request?.passengerName ?? "Passenger",
+      driverName: request?.driverName ?? "Assigned driver",
+      vehicleLabel: request?.vehicleLabel ?? "Vehicle pending",
+      plateNumber: request?.plateNumber ?? null,
+      resolvedAt: row.resolved_at,
+      resolutionNote: row.resolution_note,
+      createdAt: row.created_at,
+    };
+  });
+}
+
 export async function getPassengerDashboard(profileId: string): Promise<PassengerDashboardData> {
   const [availableDrivers, requests, reports] = await Promise.all([
     listDrivers({
@@ -925,9 +1062,11 @@ export async function getAdminDashboard(): Promise<AdminDashboardData> {
     activeDrivers,
     pendingDrivers,
     pendingReports,
+    pendingExternalReports,
     usersResponse,
     drivers,
     reports,
+    externalSafetyReports,
   ] = await Promise.all([
     countRows("profiles"),
     countRows("driver_profiles", (query) =>
@@ -939,6 +1078,9 @@ export async function getAdminDashboard(): Promise<AdminDashboardData> {
     countRows("reports", (query) =>
       query.in("report_status_id", [STATUS.REPORT_PENDING, STATUS.REPORT_IN_REVIEW])
     ),
+    countRows("external_trip_reports", (query) =>
+      query.in("report_status_id", [STATUS.REPORT_PENDING, STATUS.REPORT_IN_REVIEW])
+    ),
     supabase
       .from("profiles")
       .select("*")
@@ -946,6 +1088,7 @@ export async function getAdminDashboard(): Promise<AdminDashboardData> {
       .limit(50),
     listDrivers({ limit: 50 }),
     listAdminReports(),
+    listExternalSafetyReports(),
   ]);
 
   formatError(usersResponse.error);
@@ -954,10 +1097,11 @@ export async function getAdminDashboard(): Promise<AdminDashboardData> {
     totalUsers,
     activeDrivers,
     pendingDrivers,
-    pendingReports,
+    pendingReports: pendingReports + pendingExternalReports,
     users: (usersResponse.data ?? []) as Profile[],
     drivers,
     reports,
+    externalSafetyReports,
   };
 }
 
@@ -1139,6 +1283,40 @@ export async function updateTransportRequestStatus(
   }
 }
 
+export async function createTripSafetyShareLink(input: {
+  expiresInHours?: number;
+  requestId: string;
+}) {
+  const { data, error } = await supabase.rpc("create_trip_share_link", {
+    p_request_id: input.requestId,
+    p_expires_in_hours: input.expiresInHours ?? 72,
+  });
+
+  formatError(error);
+
+  const row = Array.isArray(data) ? data[0] : data;
+
+  if (!row?.token || !row?.id || !row?.expires_at) {
+    throw new Error("The trip safety link could not be created.");
+  }
+
+  return {
+    id: row.id as string,
+    token: row.token as string,
+    expiresAt: row.expires_at as string,
+    shareUrl: buildTripShareUrl(row.token as string),
+  } satisfies TripSafetyShareLink;
+}
+
+export async function revokeTripSafetyShareLinks(requestId: string) {
+  const { data, error } = await supabase.rpc("revoke_trip_share_links", {
+    p_request_id: requestId,
+  });
+
+  formatError(error);
+  return typeof data === "number" ? data : 0;
+}
+
 export async function updateDriverAvailability(input: {
   driverProfileId: string;
   availabilityStatusId: number;
@@ -1203,16 +1381,12 @@ export async function updateProfile(input: {
   phone?: string | null;
   city?: string | null;
 }) {
-  const { data, error } = await supabase
-    .from("profiles")
-    .update({
-      full_name: input.fullName.trim(),
-      phone: input.phone?.trim() || null,
-      city: input.city?.trim() || null,
-    })
-    .eq("id", input.profileId)
-    .select("*")
-    .single();
+  const { data, error } = await supabase.rpc("update_own_profile", {
+    p_city: input.city?.trim() || null,
+    p_full_name: input.fullName.trim(),
+    p_phone: input.phone?.trim() || null,
+    p_profile_id: input.profileId,
+  });
 
   formatError(error);
   return data as Profile;
@@ -1490,6 +1664,35 @@ export async function updateReportStatus(
     adminId,
     entityId: reportId,
     entityTable: "reports",
+    metadata: {
+      note: note?.trim() || null,
+      statusId,
+    },
+  });
+}
+
+export async function updateExternalSafetyReportStatus(
+  reportId: string,
+  statusId: number,
+  adminId: string,
+  note?: string
+) {
+  const { error } = await supabase
+    .from("external_trip_reports")
+    .update({
+      report_status_id: statusId,
+      resolved_by: adminId,
+      resolved_at: new Date().toISOString(),
+      resolution_note: note?.trim() || null,
+    })
+    .eq("id", reportId);
+
+  formatError(error);
+  await recordAdminAuditLog({
+    action: "external_trip_report_status_updated",
+    adminId,
+    entityId: reportId,
+    entityTable: "external_trip_reports",
     metadata: {
       note: note?.trim() || null,
       statusId,
